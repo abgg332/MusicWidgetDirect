@@ -39,6 +39,10 @@ static NSString *const kCfgPath = @"/var/mobile/Library/Preferences/com.mwdt.mus
 static NSString *const kLogPath = @"/var/mobile/Library/Logs/MusicWidgetDirect.log";
 static const unsigned long long kLogMaxBytes = 2ull * 1024 * 1024;
 
+// 配置结构版本：v1 → v2 把 SwallowTouch 默认改成 YES、RequireNowPlaying 改成 NO。
+// 老配置里这两项是旧默认值，靠这个版本号自动迁移，用户不用手动删配置。
+static const NSInteger kCfgCurrentVersion = 2;
+
 // MRMediaRemoteCommand
 enum {
     kMWCmdPlay      = 0,
@@ -52,8 +56,8 @@ enum {
 
 static BOOL        gEnabled            = YES;   // 总开关
 static BOOL        gVerbose            = NO;    // 详细日志（调区域时打开）
-static BOOL        gSwallow            = NO;    // YES=点击阶段直接吃掉手势
-static BOOL        gRequireNowPlaying  = YES;   // 只拦「当前正在播放的那个 App」的小组件
+static BOOL        gSwallow            = YES;   // YES=点击阶段直接吃掉手势（默认开，最直接地阻止跳转）
+static BOOL        gRequireNowPlaying  = NO;    // YES=只拦「当前正在播放的那个 App」的小组件
 static BOOL        gAttachAll          = NO;    // 组件的类型识别不出来时，挂到所有图标上
 static CGFloat     gTapWindow          = 2.5;   // 点击 → openURL 的关联时间窗（秒）
 static NSArray    *gBundleIDs          = nil;   // 白名单；空 = 所有小组件
@@ -225,21 +229,6 @@ static NSArray *MWDefaultRegions(void) {
     ];
 }
 
-static NSDictionary *MWDefaultConfig(void) {
-    return @{
-        @"Enabled"           : @YES,
-        @"VerboseLog"        : @NO,
-        @"SwallowTouch"      : @NO,
-        @"RequireNowPlaying" : @YES,
-        @"AttachToAllIcons"  : @NO,
-        @"TapWindow"         : @2.5,
-        @"BundleIDs"         : @[],
-        @"Regions"           : MWDefaultRegions(),
-        @"URLKeywords"       : @{},
-        @"FallbackAction"    : @"toggle",
-    };
-}
-
 static NSInteger MWCommandForAction(NSString *a) {
     if (![a isKindOfClass:[NSString class]]) return -1;
     NSString *s = [[a lowercaseString] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
@@ -252,6 +241,22 @@ static NSInteger MWCommandForAction(NSString *a) {
     return -1;
 }
 
+static NSDictionary *MWDefaultConfig(void) {
+    return @{
+        @"ConfigVersion"     : @(kCfgCurrentVersion),
+        @"Enabled"           : @YES,
+        @"VerboseLog"        : @NO,
+        @"SwallowTouch"      : @YES,   // 默认在点击阶段就吃掉，最直接地阻止跳转
+        @"RequireNowPlaying" : @NO,    // 不再要求「必须先有播放会话」，否则首次点播放会被放行
+        @"AttachToAllIcons"  : @NO,
+        @"TapWindow"         : @2.5,
+        @"BundleIDs"         : @[],
+        @"Regions"           : MWDefaultRegions(),
+        @"URLKeywords"       : @{},
+        @"FallbackAction"    : @"toggle",
+    };
+}
+
 static void MWLoadConfig(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kCfgPath];
     if (![d isKindOfClass:[NSDictionary class]]) {
@@ -260,11 +265,25 @@ static void MWLoadConfig(void) {
         MPLog(@"[cfg] 生成默认配置 %@", kCfgPath);
     }
 
+    // 老版本（v1）留下的配置里 SwallowTouch=NO / RequireNowPlaying=YES 是旧默认值，
+    // 会让「点按钮还是跳转」。升级到 v2 时把这两项换成新默认，其它自定义项原样保留。
+    NSInteger ver = [d[@"ConfigVersion"] integerValue];
+    if (ver < kCfgCurrentVersion) {
+        NSMutableDictionary *m = [d mutableCopy];
+        if (![m[@"SwallowTouch"] boolValue])      m[@"SwallowTouch"] = @YES;
+        if ([m[@"RequireNowPlaying"] boolValue])  m[@"RequireNowPlaying"] = @NO;
+        m[@"ConfigVersion"] = @(kCfgCurrentVersion);
+        [m writeToFile:kCfgPath atomically:YES];
+        d = m;
+        MPLog(@"[cfg] 配置升级 v%ld → v%ld（SwallowTouch=YES, RequireNowPlaying=NO）",
+              (long)ver, (long)kCfgCurrentVersion);
+    }
+
     id v = nil;
     v = d[@"Enabled"];           gEnabled           = v ? [v boolValue] : YES;
     v = d[@"VerboseLog"];        gVerbose           = v ? [v boolValue] : NO;
-    v = d[@"SwallowTouch"];      gSwallow           = v ? [v boolValue] : NO;
-    v = d[@"RequireNowPlaying"]; gRequireNowPlaying = v ? [v boolValue] : YES;
+    v = d[@"SwallowTouch"];      gSwallow           = v ? [v boolValue] : YES;
+    v = d[@"RequireNowPlaying"]; gRequireNowPlaying = v ? [v boolValue] : NO;
     v = d[@"AttachToAllIcons"];  gAttachAll         = v ? [v boolValue] : NO;
     v = d[@"TapWindow"];         gTapWindow         = v ? [v doubleValue] : 2.5;
     if (gTapWindow < 0.3) gTapWindow = 0.3;
@@ -482,30 +501,27 @@ static char kMWGRKey;
     gTapBundle = [MWBestBundle(cands) copy];
     gSuppressUntil = 0;   // 新的一次点击，解除上一次的去重窗口
 
-    MPLogD(@"[tap] 图标=%@ icon=%@ bundle=%@ cands=%@ frac=(%.2f,%.2f) size=(%.0f,%.0f)",
-           MWClassName(v), MWClassName(MWObj(v, @"icon")),
-           gTapBundle ?: @"(未知)", [cands componentsJoinedByString:@"|"],
-           gTapFx, gTapFy, sz.width, sz.height);
+    // 这行**总是**写日志：它是判断「手势到底有没有触发」的唯一依据，
+    // 之前用 verbose 开关挡住，导致排查时看不到，绕了一圈。
+    MPLog(@"[tap] bundle=%@ frac=(%.2f,%.2f) size=(%.0f,%.0f) icon=%@ cands=%@",
+          gTapBundle ?: @"(未知)", gTapFx, gTapFy, sz.width, sz.height,
+          MWClassName(MWObj(v, @"icon")), [cands componentsJoinedByString:@"|"]);
 }
 
 - (void)handle:(UITapGestureRecognizer *)gr {
     [self recordTap:gr];
     if (!gSwallow) return;   // 记录模式：后面交给 URL 拦截层处理
 
-    // 吃掉模式：点击当场就判定，不再等 URL
+    // 吃掉模式：点击当场就判定，根本不给小组件 openURL 的机会
     MWEnsureConfig();
     if (!gEnabled) return;
     NSInteger cmd = MWActionFromPoint(gTapPoint, gTapSize);
     if (cmd < 0) cmd = gFallbackCmd;
-    if (gRequireNowPlaying && !MWCandsMatchList(gTapCands, @[ gNowPlayingBundle ?: @"" ])) {
-        MPLogD(@"[tap] 当前播放 App 不是这个小组件，放行");
-        return;
-    }
     MWSendCommand((int)cmd);
     gTapTime = 0;
     gSuppressUntil = CFAbsoluteTimeGetCurrent() + 1.2;
-    MPLog(@"[hit-swallow] bundle=%@ frac=(%.2f,%.2f) cmd=%ld",
-          gTapBundle ?: @"?", gTapFx, gTapFy, (long)cmd);
+    MPLog(@"[hit-swallow] bundle=%@ frac=(%.2f,%.2f) cmd=%ld np=%@",
+          gTapBundle ?: @"?", gTapFx, gTapFy, (long)cmd, gNowPlayingBundle ?: @"(无)");
 }
 
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gr {
@@ -518,6 +534,11 @@ static char kMWGRKey;
     if (!v) return NO;
     CGPoint p = [gr locationInView:v];
     return MWActionFromPoint(p, v.bounds.size) >= 0;
+}
+
+// 必须显式收下这个触摸：桌面上的图标手势很多，不表态容易被别人的识别器抢走
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldReceiveTouch:(UITouch *)t {
+    return YES;
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
@@ -575,31 +596,32 @@ static BOOL MWHandleURL(NSURL *url, NSString *src) {
     }
 
     // ② 前提：必须刚刚在小组件上点过。没有这个前提一律放行，避免误伤 App 内部跳转。
-    if (gTapTime <= 0 || now - gTapTime > gTapWindow) {
-        MPLogD(@"[url] 不是小组件点击引发的，放行: %@ (%@)", abs, src);
+    if (gTapTime <= 0) {
+        MPLogD(@"[url] 没有小组件点击前情，放行: %@ (%@)", abs, src);
+        return NO;
+    }
+    if (now - gTapTime > gTapWindow) {
+        // 记录到了点击、但 URL 来得太晚：说明「点击→跳转」的间隔比窗口长，需要调大 TapWindow
+        MPLog(@"[url] 点击已过 %.1fs（窗口 %.1fs），放行: %@", now - gTapTime, gTapWindow, abs);
         return NO;
     }
 
     // ③ 白名单
     if (!MWCandsMatchList(gTapCands, gBundleIDs)) {
-        MPLogD(@"[url] 不在白名单: %@ 放行", gTapBundle ?: @"?");
+        MPLog(@"[url] 不在白名单: %@ 放行", gTapBundle ?: @"?");
         return NO;
     }
 
-    // ④ 只处理「当前正在播放的那个 App」的小组件，其它 App 的小组件照常打开 App
-    if (gRequireNowPlaying) {
-        if (!gNowPlayingBundle.length) {
-            MPLogD(@"[url] 当前没有正在播放的 App，放行: %@", abs);
-            return NO;
-        }
-        if (!MWCandsMatchList(gTapCands, @[ gNowPlayingBundle ])) {
-            MPLogD(@"[url] 正在播放的是 %@，不是这个小组件(%@)，放行",
-                   gNowPlayingBundle, gTapBundle ?: @"?");
-            return NO;
-        }
+    // ④ 若系统明确报告「另一个 App 正在放歌」，而这个小组件不是它 → 放行，避免误伤非音乐小组件。
+    //    注意：不再要求「必须先有播放会话」。首次点播放按钮时 App 还没起来、没有会话，
+    //    旧逻辑在这里放行，结果就是「点了还是跳转」。
+    if (gRequireNowPlaying && gNowPlayingBundle.length &&
+        !MWCandsMatchList(gTapCands, @[ gNowPlayingBundle ])) {
+        MPLog(@"[url] 正在播放的是 %@，不是这个小组件(%@)，放行", gNowPlayingBundle, gTapBundle ?: @"?");
+        return NO;
     }
 
-    // ⑤ 定动作：URL 关键字 → 点击区域 → 兜底
+    // ⑤ 定动作：URL 关键字 → 点击区域
     NSInteger cmd = MWActionFromURL(abs);
     NSString *via = @"url";
     if (cmd < 0) {
@@ -607,19 +629,16 @@ static BOOL MWHandleURL(NSURL *url, NSString *src) {
         via = @"region";
     }
     if (cmd < 0) {
-        if (!gSwallow) {
-            MPLogD(@"[url] 落在非控制区且 URL 无动作信息，放行（正常打开 App）: %@", abs);
-            return NO;
-        }
-        cmd = gFallbackCmd;
-        via = @"fallback";
+        MPLog(@"[url] 非控制区且 URL 无动作信息，放行（正常打开 App）: %@", abs);
+        return NO;
     }
 
     MWSendCommand((int)cmd);
     gTapTime = 0;
     gSuppressUntil = now + 1.2;
-    MPLog(@"[hit] %@ bundle=%@ frac=(%.2f,%.2f) cmd=%ld via=%@ url=%@",
-          src, gTapBundle ?: @"?", gTapFx, gTapFy, (long)cmd, via, abs);
+    MPLog(@"[hit] %@ bundle=%@ frac=(%.2f,%.2f) cmd=%ld via=%@ np=%@ url=%@",
+          src, gTapBundle ?: @"?", gTapFx, gTapFy, (long)cmd, via,
+          gNowPlayingBundle ?: @"(无)", abs);
     return YES;
 }
 
@@ -640,6 +659,24 @@ static void mw_openURL_opts(id self, SEL _cmd, NSURL *url, NSDictionary *opts, v
         return;
     }
     if (orig_openURL_opts) orig_openURL_opts(self, _cmd, url, opts, completion);
+    else if (completion) completion(NO);
+}
+
+// --- 9.1b SpringBoard 自己可能覆盖了 openURL:，只在 UIApplication 上挂钩子会漏 ---
+
+static BOOL (*orig_sb_openURL)(id, SEL, NSURL *);
+static BOOL mw_sb_openURL(id self, SEL _cmd, NSURL *url) {
+    if (MWHandleURL(url, @"SpringBoard.openURL:")) return YES;
+    return orig_sb_openURL ? orig_sb_openURL(self, _cmd, url) : NO;
+}
+
+static void (*orig_sb_openURL_opts)(id, SEL, NSURL *, NSDictionary *, void (^)(BOOL));
+static void mw_sb_openURL_opts(id self, SEL _cmd, NSURL *url, NSDictionary *opts, void (^completion)(BOOL)) {
+    if (MWHandleURL(url, @"SpringBoard.openURL:options:")) {
+        if (completion) completion(YES);
+        return;
+    }
+    if (orig_sb_openURL_opts) orig_sb_openURL_opts(self, _cmd, url, opts, completion);
     else if (completion) completion(NO);
 }
 
@@ -705,6 +742,11 @@ static void MWInstallAllHooks(void) {
     MWInstallHook("UIApplication", "openURL:", (IMP)mw_openURL_basic, (IMP *)&orig_openURL_basic);
     MWInstallHook("UIApplication", "openURL:options:completionHandler:",
                   (IMP)mw_openURL_opts, (IMP *)&orig_openURL_opts);
+
+    // SpringBoard 若自己实现了 openURL:，上面的 UIApplication 钩子不会生效，这里补一份
+    MWInstallHook("SpringBoard", "openURL:", (IMP)mw_sb_openURL, (IMP *)&orig_sb_openURL);
+    MWInstallHook("SpringBoard", "openURL:options:completionHandler:",
+                  (IMP)mw_sb_openURL_opts, (IMP *)&orig_sb_openURL_opts);
 
     MWInstallHook("LSApplicationWorkspace", "openURL:withOptions:", (IMP)mw_ls_openURL, (IMP *)&orig_ls_openURL);
     MWInstallHook("LSApplicationWorkspace", "openSensitiveURL:withOptions:",

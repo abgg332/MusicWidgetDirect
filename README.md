@@ -33,7 +33,8 @@
 拦截成立后，用私有框架 `MediaRemote` 发命令（`kMRMediaRemoteCommand` 0/1/2/4/5），这和你按耳机线控、锁屏控制中心是同一套指令 —— 所以对 App 来说和真的按了按钮没区别。
 
 > 特意**没有**直接吃掉你的点击手势：iOS 17 有些小组件用的是 AppIntent 按钮，本来就不跳 App，吃掉手势会让它失效。默认只在「它真的要去开 App」那一刻动手。
-> 如果你的系统上拦不住（见第 6 节排错），把 `SwallowTouch` 改成 `true`，改成在点击阶段就吃掉。
+> 0.2.0 起默认就是「点击直接吃掉」（`SwallowTouch=true`），因为 URL 那条路在不同 App 上不总灵。
+> 如果你的机型上吃掉手势反而让按钮失灵（极少），把 `SwallowTouch` 改成 `false` 回退到纯 URL 拦截。
 
 ## 3. 目录
 
@@ -62,7 +63,7 @@ MusicWidgetDirect/
 3. 点小组件的播放/暂停、上一首、下一首 → **原地生效**，App 不起来
 4. 点封面、点小组件其它区域 → 正常打开 App（这是你要的，别的地方还能进 App）
 
-不用配置就能用：默认 = 全部小组件 + 只对「正在放歌的那个 App」生效 + 按钮区在小组件下半部三等分。
+不用配置就能用。0.2.0 默认行为：**所有小组件**的**下半部三等分区域**（左/中/右 = 上一首/播放暂停/下一首）点击时直接拦截并控制播放；点封面等其它区域照常打开 App。
 
 首次运行会自动生成配置文件：
 
@@ -78,8 +79,8 @@ MusicWidgetDirect/
 |---|---|---|
 | `Enabled` | `true` | 总开关 |
 | `VerboseLog` | `false` | 详细日志。调参时打开，日常关掉 |
-| `SwallowTouch` | `false` | `true` = 点击阶段直接吃掉手势（URL 拦不住时才用） |
-| `RequireNowPlaying` | `true` | 只处理「当前正在播放的 App」的小组件 |
+| `SwallowTouch` | `true` | `true` = 点击阶段直接吃掉手势（默认，最可靠）；`false` = 只靠 URL 拦截 |
+| `RequireNowPlaying` | `false` | `true` = 只有当**确实有别的 App 在放歌**、且不是这个小组件时才放行（防误伤） |
 | `AttachToAllIcons` | `false` | 识别不出小组件类型时，把观察手势挂到所有图标上（排查用） |
 | `TapWindow` | `2.5` | 点击 → openURL 的关联时间窗（秒）。慢速机型可调大到 3.5 |
 | `BundleIDs` | `[]` | 白名单，空 = 所有小组件。填主包名即可，例如 `["com.netease.cloudmusic"]` |
@@ -144,9 +145,11 @@ MusicWidgetDirect/
 
 ### 6.1 三步定位问题
 
-1. 配置里把 `VerboseLog` 设成 `true`，保存（立即生效）
-2. 在桌面上点一次那个不听话的按钮（会跳一下 App，忍一下）
-3. Filza 打开 `/var/mobile/Library/Logs/MusicWidgetDirect.log`，看最后几行
+1. 在桌面上点一次那个不听话的按钮
+2. Filza 打开 `/var/mobile/Library/Logs/MusicWidgetDirect.log`，看最后几行
+
+> 0.2.0 起 `[tap]` / `[hit]` / `[url]` 这几行**默认就写**，不用再开 `VerboseLog`。
+> 想看到每一次 URL 判定（包括窗口外的），再把 `VerboseLog` 打开。
 
 关键日志长这样：
 

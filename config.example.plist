@@ -8,6 +8,9 @@
 -->
 <plist version="1.0">
 <dict>
+    <key>ConfigVersion</key>
+    <integer>2</integer>
+
     <key>Enabled</key>
     <true/>
 
@@ -15,10 +18,10 @@
     <false/>
 
     <key>SwallowTouch</key>
-    <false/>
+    <true/>
 
     <key>RequireNowPlaying</key>
-    <true/>
+    <false/>
 
     <key>AttachToAllIcons</key>
     <false/>
