@@ -3,5 +3,5 @@
    源码里任何地方要显示版本，都用 MY_VERSION，不要再手写字符串。 */
 #ifndef MY_VERSION_H
 #define MY_VERSION_H
-#define MY_VERSION @"0.4.0"
+#define MY_VERSION @"0.5.0"
 #endif

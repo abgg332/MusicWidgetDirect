@@ -22,28 +22,33 @@
 
 ## 2. 它怎么做到「点了不跳」
 
-**关键事实（0.1/0.2 就是在这里翻的车）**：第三方音乐小组件的按钮根本不调用
-`openURL`，小组件自己（或 SpringBoard 的图标手势）直接把 App 拉起来。所以拦
-URL 等于拦空气 —— 真机日志里 `[tap]`、`[hit]`、`[cmd]` 全有，`[url]` 一条没有。
+**关键事实**：第三方音乐小组件的按钮不调用 `openURL`，小组件自己（或 SpringBoard
+的图标手势）直接把 App 拉起来。所以拦 URL 等于拦空气 —— 真机日志里 `[tap]`、
+`[cmd]` 全有，`[url]` 一条没有。
 
-0.4 一共四道，全部要过：
+还有一个更隐蔽的点：**手势识别器挂在祖先视图上时，会观察整棵子树里的触摸**。
+所以只在小组件上盖一层透明视图是没用的（0.3.0 就死在这里）；而把手势直接
+`enabled = NO` 又会把桌面上所有图标点按一起废掉（0.4.0 卡死在这里）。
 
-| 层 | 做法 | 效果 |
-|---|---|---|
-| ① 遮盖层 | 把音乐小组件**整块**盖上一层透明视图，`hitTest` 直接返回它 | 小组件的远程视图收不到触摸 |
-| ② 关掉图标点按手势 | 把图标视图上「点一下开 App」的 `UITapGestureRecognizer` 关掉；`gestureRecognizerShouldBegin:` 再挡一层 | **关键**：祖先视图的手势照样能收到子视图里的触摸，只盖遮盖层是挡不住的（0.3.0 就死在这一步） |
-| ③ 启动闸门 | `FBSSystemService` / `FBSOpenApplicationService` / `LSApplicationWorkspace` 的所有打开变体 / `iconTapped:` | 万一还漏，掐掉 1.5 秒内同一个 App 的启动 |
-| ④ URL 兜底 | 老系统上仍然走 `openURL` 的，照旧吞掉 | 兼容 |
+0.5 的做法是「按钮条 + 手势闸门」，不加遮盖、不算坐标：
 
-遮盖层自己接点击 → 用私有框架 `MediaRemote` 发命令（0=播放、1=暂停、2=播放暂停、
-4=下一首、5=上一首），和耳机线控、锁屏控制中心是**同一套指令**，App 看来和真按了按钮没区别。
+| 层 | 做法 |
+|---|---|
+| ① 按钮条 | 在音乐小组件的控制区里摆 3 个**透明按钮**（左/中/右 = 上一首/播放暂停/下一首），按钮的 `tag` 就是命令号。点中即发 MediaRemote 命令，没有任何坐标换算 |
+| ② `hitTest` 只给按钮 | 覆盖层的 `hitTest` 在按钮范围内返回按钮，**其它位置返回 nil**，触摸穿透给小组件 → 点封面照常打开 App，不需要插件代劳 |
+| ③ 手势闸门 | 祖先的点击识别器用 `gestureRecognizerShouldBegin:` 挡，**只挡落在按钮上的 tap**，长按/拖动一律放行（还能正常编辑小组件） |
+| ④ 启动闸门 + URL | 万一还漏，掐掉 1.5 秒内同一个 App 的启动；老系统走 `openURL` 的照旧吞掉 |
+
+按钮点击 → 私有框架 `MediaRemote` 发命令（0=播放、1=暂停、2=播放暂停、4=下一首、
+5=上一首），和耳机线控、锁屏控制中心是**同一套指令**，App 看来和真按了按钮没区别。
 
 两条重要边界：
 
 - **只接管音乐 App 的小组件**（内置酷狗、QQ 音乐、网易云、汽水、酷我、咪咕、Spotify、
-  Apple Music 等主包名）。天气、日历、支付宝这些小部件一个像素都不碰。
-- **点封面区（控制区之外）** → 插件自己把 App 打开，和原来手感一致。
-- **长按小组件 0.55 秒** → 暂停接管 6 秒，方便拖动/编辑/删除。
+  Apple Music 等主包名），而且必须是「真小组件」：宽 ≥130 且 icon 是 `SBWidgetIcon`。
+  普通 App 图标、资源库堆叠、天气/日历/支付宝小组件一个像素都不碰。
+- **点封面区 / 上半部分** → 触摸穿透，走小组件原本的行为（打开 App）。想编辑小组件
+  直接长按封面区即可。
 
 ## 3. 目录
 
@@ -72,9 +77,9 @@ MusicWidgetDirect/
 3. 点小组件的播放/暂停、上一首、下一首 → **原地生效**，App 不起来
 4. 点封面、点小组件其它区域 → 正常打开 App（这是你要的，别的地方还能进 App）
 
-不用配置就能用。0.3 默认行为：**音乐 App 的小组件**、**下半部三等分区域**（左/中/右 = 上一首/播放暂停/下一首）由遮盖层接管，点了原地生效、不跳 App；点上半部分（封面区）照常打开 App。
+不用配置就能用。0.5 默认行为：**音乐 App 的小组件**、**下半部三等分区域**（左/中/右 = 上一首/播放暂停/下一首）放的是透明按钮，点了原地生效、不跳 App；点上半部分（封面区）照常打开 App。
 
-长按控制区 0.55 秒可暂时放开接管 6 秒，方便编辑/拖动小组件。
+要编辑/拖动小组件，长按封面区即可（长按不吃接管）。
 
 首次运行会自动生成配置文件：
 
@@ -90,7 +95,7 @@ MusicWidgetDirect/
 |---|---|---|
 | `Enabled` | `true` | 总开关 |
 | `VerboseLog` | `false` | 详细日志。调参时打开，日常关掉 |
-| `SwallowTouch` | `true` | `true` = 用遮盖层接管（默认）；`false` = 只挂观察手势 + 拦 URL（老方案，基本不管用，仅用于对比调试） |
+| `SwallowTouch` | `true` | `true` = 用按钮条接管（默认，也是唯一有效的方案）；`false` = 完全不管触摸（只留启动闸门 + URL 兜底，用来对比） |
 | `RequireNowPlaying` | `false` | `true` = 只有当**确实有别的 App 在放歌**、且不是这个小组件时才放行（防误伤） |
 | `AttachToAllIcons` | `false` | 已废弃，保留只为兼容老配置 |
 | `TapWindow` | `2.5` | 点击 → openURL 的关联时间窗（秒）。慢速机型可调大到 3.5 |
@@ -161,33 +166,32 @@ MusicWidgetDirect/
 2. Filza 打开 `/var/mobile/Library/Logs/MusicWidgetDirect.log`，看最后几行
 3. 对照下表
 
-装好第一次 respring 后，日志里应该出现这三类行：
+装好第一次 respring 后应该出现：
 
 ```
-[shield] 已接管 SBIconView bundle=com.kugou.kugou1002.KGWidget bounds=(364,184) 手势=<UITapGestureRecognizer(已关)>
+[shield] 已接管 SBIconView bundle=com.kugou.kugou1002.KGWidget bounds=(364,184) 按钮=3
 [hook] 已挂 SBIconView -hitTest:withEvent:
 [hook] 已挂 SBIconView -gestureRecognizerShouldBegin:
-[hook] 已挂 SBIconController -iconTapped:
 ```
 
-点一下按钮之后，成功的样子是：
+点一下按钮，成功的样子：
 
 ```
-[tap] bundle=com.kugou.kugou1002.KGWidget frac=(0.42,0.84) size=(364,184) icon=SBWidgetIcon cmd=2 via=region
+[gr] 挡下落在按钮上的 SBIconTapGestureRecognizer (SBIconView)
 [cmd] MediaRemote 发送命令 2（返回 1）
-[hit] shield bundle=com.kugou.kugou1002.KGWidget frac=(0.42,0.84) cmd=2 np=(无)
+[hit] button bundle=com.kugou.kugou1002.KGWidget cmd=2 frac=(0.50,0.78) np=(无)
 ```
 
 `cmd`：`0`播放 `1`暂停 `2`播放/暂停切换 `4`下一首 `5`上一首。
-`返回 1` = 系统接受了这条媒体命令；`返回 0` = 没有活跃的播放会话（先在 App 里放一首）。
+`返回 1` = 系统接受了这条媒体命令；`返回 0` = 没有活跃的播放会话。
 
 | 你看到的 | 含义 | 怎么办 |
 |---|---|---|
-| 日志里没有 `[shield] 已接管` | 这个小组件没被认成音乐 App，或尺寸不合适 | 把它的主包名写进 `MusicBundleIDs` |
-| `[shield]` 有，点了没反应也没日志 | 遮盖层被别的东西盖住了 | 把日志发我，我看 `rect=` 和 `size=` 对不上就是区域问题 |
-| 有 `[tap]` 但仍跳转 | 遮盖层没接到，是启动闸门没盖住的路径 | 日志里会有 `[gate]` 行，把行发我 |
-| 有 `[gate] ... 不是刚点的小组件，放行` | 认到的目标 App 和小组件包名对不上 | 同上，发我日志 |
-| 动作不对（点播放变切歌） | 落点区域划分和这个小组件不匹配 | 照 `frac=` 改 `Regions`（6.2） |
+| 没有 `[shield] 已接管` | 没被认成音乐小组件（尺寸或 icon 类型不符） | 把小组件主包名写进 `MusicBundleIDs`，日志发我 |
+| 有 `[shield]` 但点击没反应也没 `[hit]` | 按钮区域和实际按钮位置不重合 | 按 6.2 调 `Regions` |
+| 有 `[gr] 挡下…` 但 App 还是起来 | 还有别的入口在拉起 App | 日志里会有 `[gate]` 行，发我那一行 |
+| 动作不对（点播放变切歌） | 三个按钮的左右划分和小组件不匹配 | 按 6.2 调 `Regions` |
+| 点按钮完全没反应，日志也干净 | 没在放歌，命令无处可发 | 先在 App 里放一首再回桌面测 |
 
 ### 6.2 按日志改区域
 
@@ -206,7 +210,7 @@ MusicWidgetDirect/
 ```bash
 # 看插件有没有被注入
 tail -20 /var/mobile/Library/Logs/MusicWidgetDirect.log
-# 期望开头有：==== MusicWidgetDirect 0.4.0 载入 (pid=..., SpringBoard) ====
+# 期望开头有：==== MusicWidgetDirect 0.5.0 载入 (pid=..., SpringBoard) ====
 
 # 卸载
 dpkg -r com.mwdt.musicwidgetdirect && killall -9 SpringBoard
@@ -225,7 +229,7 @@ echo "ghp_xxxx" > ~/.gh_token && chmod 600 ~/.gh_token
 
 # 发版
 grep -E '^Version:' control; grep -E 'MY_VERSION' Version.h   # 两个版本号必须一致
-python3 push2.py "0.4.0: 关掉图标点按手势 + 整块遮盖" Makefile control MusicWidgetDirect.plist Tweak.mm Version.h .github/workflows/build.yml
+python3 push2.py "0.5.0: 按钮条 + 手势闸门" Makefile control MusicWidgetDirect.plist Tweak.mm Version.h .github/workflows/build.yml
 
 # 取包
 gh run list --repo <owner/repo> --limit 1
@@ -237,7 +241,7 @@ gh run download <run-id> --repo <owner/repo> -D out
 
 ```bash
 export PATH=/var/jb/usr/bin:$PATH
-dpkg -i out/pkg-rootless/MusicWidgetDirect-0.4.0-rootless-arm64-arm64e.deb
+dpkg -i out/pkg-rootless/MusicWidgetDirect-0.5.0-rootless-arm64-arm64e.deb
 killall -9 SpringBoard
 ```
 
