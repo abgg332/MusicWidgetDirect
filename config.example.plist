@@ -30,6 +30,9 @@
     <real>2.5</real>
 
     <!-- 空数组 = 所有小组件都管。只想管一个 App 就填它的主包名 -->
+    <key>MusicBundleIDs</key>
+    <array/>
+
     <key>BundleIDs</key>
     <array>
     </array>

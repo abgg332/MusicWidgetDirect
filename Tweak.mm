@@ -4,18 +4,16 @@
 //   第三方音乐 App 的桌面小组件，点播放/上一首/下一首的按钮，实际是把整个
 //   小组件做成一个 Link，点了就 openURL 把 App 拉到前台，音乐并没有真的被控制。
 //
-// 做法（两层，互不干扰）：
-//   ① 记录层：在小组件图标视图上挂一个「只观察、不吃掉」的点击手势，
-//      记下这次点击发生在小组件的哪个位置（归一化坐标）+ 这个小组件属于哪个 App。
-//   ② 拦截层：hook 进程内所有 URL 打开入口。当一次 URL 打开紧跟在「小组件点击」
-//      之后发生，就把它吞掉，改发 MediaRemote 媒体命令（播放/暂停、上一首、下一首）。
+// 做法（三层，从物理到兜底）：
+//   ① 遮盖层：在音乐 App 小组件的控制区上盖一层透明视图，hitTest 直接返回它。
+//      触摸根本到不了小组件，App 自然不会被拉起来；点击由遮盖层自己接，发媒体命令。
+//   ② 启动闸门：万一触摸漏到 SpringBoard 的图标手势上，就用 FBSSystemService /
+//      FBSOpenApplicationService / _launchApplication 这些入口把「刚点过的那个 App」
+//      的启动掐掉（只掐 1.5 秒内的、只掐同一个 App）。
+//   ③ URL 拦截：老系统上仍然走 openURL 的，兜底吞掉并改发媒体命令。
 //
-//   之所以「先记位置、再拦 URL」而不是直接吃掉手势：
-//     · 小组件如果用的是 iOS17 的 AppIntent 按钮，它本来就不跳 App，
-//       我们不吃手势 → 它照常工作，我们不重复发命令；
-//     · 只有它真的要去开 App 时我们才拦，行为可预期，不会把小组件的其它交互搞坏。
-//   如果你的机型/系统上「URL 拦不住」（日志里没有 [url] 行、但 App 还是被拉起来了），
-//   把配置里的 SwallowTouch 改成 true，改成在点击阶段直接吃掉手势。
+// 0.1/0.2 只做了 ③ + 观察手势，真机日志证明酷狗/汽水根本不走 openURL，
+// 所以 0.3 必须靠 ①（物理隔离）才拦得住。
 //
 // 编译：本文件是 .mm，不走 Logos（%hook 不会展开），所有 hook 都是手写
 //       MSHookMessageEx —— 见每个 hook 上方的注释。
@@ -63,6 +61,7 @@ static CGFloat     gTapWindow          = 2.5;   // 点击 → openURL 的关联�
 static NSArray    *gBundleIDs          = nil;   // 白名单；空 = 所有小组件
 static NSArray    *gRegions            = nil;   // 区域 → 动作
 static NSDictionary *gURLKeywords      = nil;   // 自定义 URL 关键字 → 动作
+static NSArray    *gMusicBundles       = nil;   // 额外的「音乐 App」白名单（空=用内置列表）
 static NSInteger   gFallbackCmd        = kMWCmdToggle; // 都没命中时的兜底动作
 static BOOL        gLoaded             = NO;
 static time_t      gCfgSec             = 0;
@@ -79,6 +78,11 @@ static NSArray    *gTapCands           = nil;   // 这个小组件所有能拿�
 
 // 一次点击可能触发多个 URL，1.2s 内全部吞掉，且只发一次命令
 static double      gSuppressUntil      = 0;
+
+// 点击之后的一小段时间内，禁止把「刚点过的那个小组件所属 App」拉到前台。
+// 这是最后一道保险：遮盖层已经让小组件收不到触摸了，但如果某个系统的
+// hitTest 路径绕过了遮盖层，这里还能把启动动作掐掉。
+static double      gBlockUntil         = 0;
 
 // 当前「正在播放」的 App（定时刷新）
 static NSString   *gNowPlayingBundle   = nil;
@@ -140,7 +144,7 @@ static void MPLogD(NSString *fmt, ...) {
 // 不链接私有框架，全部 dlsym —— 编不过的风险为零，缺符号时降级到
 // SBMediaController（SpringBoard 自带的媒体控制器）。
 
-typedef void (*MWMRSendCommand)(int command, id userInfo);
+typedef bool (*MWMRSendCommand)(int command, id userInfo);
 typedef void (*MWMRGetDisplayID)(dispatch_queue_t q, void (^blk)(id displayID));
 typedef void (*MWMRGetIsPlaying)(dispatch_queue_t q, void (^blk)(BOOL playing));
 
@@ -176,8 +180,8 @@ static id MWObj(id obj, NSString *selName) {
 static void MWSendCommand(int cmd) {
     MWLoadMediaRemote();
     if (pMRSendCommand) {
-        pMRSendCommand(cmd, nil);
-        MPLog(@"[cmd] MediaRemote 发送命令 %d", cmd);
+        bool ok = pMRSendCommand(cmd, nil);
+        MPLog(@"[cmd] MediaRemote 发送命令 %d（返回 %d）", cmd, ok ? 1 : 0);
         return;
     }
     // 降级：只能处理播放/暂停
@@ -251,6 +255,7 @@ static NSDictionary *MWDefaultConfig(void) {
         @"AttachToAllIcons"  : @NO,
         @"TapWindow"         : @2.5,
         @"BundleIDs"         : @[],
+        @"MusicBundleIDs"    : @[],   // 内置音乐 App 列表之外的补充（写主包名即可）
         @"Regions"           : MWDefaultRegions(),
         @"URLKeywords"       : @{},
         @"FallbackAction"    : @"toggle",
@@ -291,6 +296,9 @@ static void MWLoadConfig(void) {
 
     NSArray *ids = d[@"BundleIDs"];
     gBundleIDs = [ids isKindOfClass:[NSArray class]] ? ids : @[];
+
+    NSArray *mb = d[@"MusicBundleIDs"];
+    gMusicBundles = [mb isKindOfClass:[NSArray class]] ? mb : @[];
 
     NSArray *regs = d[@"Regions"];
     gRegions = [regs isKindOfClass:[NSArray class]] && regs.count ? regs : MWDefaultRegions();
@@ -408,6 +416,57 @@ static NSString *MWBestBundle(NSArray *cands) {
     return best;
 }
 
+// 内置「音乐 App」主包名前缀。
+// 只对这批 App 的小组件做接管——否则天气、日历、支付宝这些小部件的下半部分
+// 也会被吃掉，反而把正常功能搞坏（0.1/0.2 就吃了这个亏）。
+static NSArray *MWDefaultMusicBundles(void) {
+    return @[
+        @"com.kugou.kugou1002",          // 酷狗
+        @"com.tencent.qqmusic",          // QQ 音乐
+        @"com.netease.cloudmusic",       // 网易云音乐
+        @"com.soda.music",               // 汽水音乐
+        @"com.kuwo.player",              // 酷我
+        @"com.migu.music",               // 咪咕音乐
+        @"com.hongyun.music",            // 番茄畅听音乐版
+        @"com.spotify.client",           // Spotify
+        @"com.apple.music",              // Apple Music
+        @"com.google.ios.youtubemusic",  // YouTube Music
+        @"com.ximalaya.ting",            // 喜马拉雅
+        @"com.gemd.iting",               // 喜马拉雅（旧版）
+    ];
+}
+
+// 这个小组件是不是音乐 App 的：按主包名前缀匹配（com.x.y.KGWidget → com.x.y）
+static BOOL MWIsMusicCands(NSArray *cands) {
+    NSMutableArray *list = [NSMutableArray arrayWithArray:MWDefaultMusicBundles()];
+    for (id p in gMusicBundles) {
+        if ([p isKindOfClass:[NSString class]] && [p length]) [list addObject:p];
+    }
+    for (NSString *c in cands) {
+        if (![c isKindOfClass:[NSString class]] || ![c length]) continue;
+        NSString *x = [c lowercaseString];
+        for (NSString *p in list) {
+            NSString *lp = [p lowercaseString];
+            if ([x isEqualToString:lp] || [x hasPrefix:[lp stringByAppendingString:@"."]]) return YES;
+        }
+    }
+    return NO;
+}
+
+// 目标 App 是不是「刚被点的那个小组件」的宿主 App
+static BOOL MWTapOwnsTarget(NSString *target) {
+    if (![target isKindOfClass:[NSString class]] || ![target length]) return NO;
+    NSString *t = [target lowercaseString];
+    for (NSString *c in gTapCands) {
+        if (![c isKindOfClass:[NSString class]] || ![c length]) continue;
+        NSString *x = [c lowercaseString];
+        if ([x isEqualToString:t]) return YES;
+        if ([x hasPrefix:[t stringByAppendingString:@"."]]) return YES;   // com.a.b.KGWidget vs com.a.b
+        if ([t hasPrefix:[x stringByAppendingString:@"."]]) return YES;
+    }
+    return NO;
+}
+
 // ======================= 6. 动作判定 =======================
 
 // URL 里的动作关键字。按 token 精确匹配，避免 "player" 里的 "play" 造成误判。
@@ -476,107 +535,171 @@ static NSInteger MWActionFromPoint(CGPoint p, CGSize sz) {
     return -1;
 }
 
-// ======================= 7. 点击记录 =======================
+// ======================= 7. 触摸接管（透明遮盖层） =======================
+//
+// 0.2.0 的「挂观察手势 + 拦 URL」在真机上不成立。日志已经证明了：
+//   [tap] 有、[hit-swallow] 有、[cmd] 也发出去了，但**一条 [url] 都没有** ——
+//   说明酷狗/汽水这类小组件根本不走 openURL，而是小组件自己（或 SpringBoard
+//   的图标手势）直接把 App 拉起来。拦 URL 等于拦空气。
+//
+// 0.3.0 改成物理隔离：在小组件的控制区上面盖一层**透明遮盖层**。
+//   · 触摸落在遮盖层上，hitTest 直接返回遮盖层 —— 小组件和 SpringBoard 的手势
+//     都收不到这次触摸，App 自然不会起来；
+//   · 遮盖层自己收点击 → 发 MediaRemote 命令（和耳机线控同一套指令）；
+//   · 长按遮盖层 0.55 秒 → 暂停接管 6 秒，方便正常拖动/编辑小组件。
+// 遮盖层只装给「音乐 App 的小组件」，其它小组件一个像素都不碰。
 
-static char kMWGRKey;
+static char kMWShieldKey;
+static char kMWProxyKey;
+static double gShieldOffUntil = 0;
 
 @interface MWTapProxy : NSObject <UIGestureRecognizerDelegate>
+@property (nonatomic, weak) UIView *hostView;
 @end
 
 @implementation MWTapProxy
 
-- (void)recordTap:(UIGestureRecognizer *)gr {
-    UIView *v = gr.view;
-    if (!v) return;
-    NSArray *cands = MWIconCandidates(v);
-    CGPoint p = [gr locationInView:v];
-    CGSize sz = v.bounds.size;
+- (void)handleShieldTap:(UITapGestureRecognizer *)gr {
+    UIView *host = self.hostView;
+    if (!host || !gr) return;
+    MWEnsureConfig();
+    if (!gEnabled) return;
+
+    NSArray *cands = MWIconCandidates(host);
+    CGPoint p  = [gr locationInView:host];
+    CGSize  sz = host.bounds.size;
 
     gTapPoint  = p;
     gTapSize   = sz;
     gTapFx     = (sz.width  > 0) ? p.x / sz.width  : -1;
     gTapFy     = (sz.height > 0) ? p.y / sz.height : -1;
-    gTapTime   = CFAbsoluteTimeGetCurrent();
     gTapCands  = [cands copy];
     gTapBundle = [MWBestBundle(cands) copy];
-    gSuppressUntil = 0;   // 新的一次点击，解除上一次的去重窗口
+    gTapTime   = CFAbsoluteTimeGetCurrent();
+    gSuppressUntil = 0;
 
-    // 这行**总是**写日志：它是判断「手势到底有没有触发」的唯一依据，
-    // 之前用 verbose 开关挡住，导致排查时看不到，绕了一圈。
-    MPLog(@"[tap] bundle=%@ frac=(%.2f,%.2f) size=(%.0f,%.0f) icon=%@ cands=%@",
+    NSInteger cmd = MWActionFromPoint(p, sz);
+    NSString *via = @"region";
+    if (cmd < 0) { cmd = gFallbackCmd; via = @"fallback"; }
+
+    MPLog(@"[tap] bundle=%@ frac=(%.2f,%.2f) size=(%.0f,%.0f) icon=%@ cmd=%ld via=%@",
           gTapBundle ?: @"(未知)", gTapFx, gTapFy, sz.width, sz.height,
-          MWClassName(MWObj(v, @"icon")), [cands componentsJoinedByString:@"|"]);
-}
+          MWClassName(MWObj(host, @"icon")), (long)cmd, via);
 
-- (void)handle:(UITapGestureRecognizer *)gr {
-    [self recordTap:gr];
-    if (!gSwallow) return;   // 记录模式：后面交给 URL 拦截层处理
-
-    // 吃掉模式：点击当场就判定，根本不给小组件 openURL 的机会
-    MWEnsureConfig();
-    if (!gEnabled) return;
-    NSInteger cmd = MWActionFromPoint(gTapPoint, gTapSize);
-    if (cmd < 0) cmd = gFallbackCmd;
     MWSendCommand((int)cmd);
-    gTapTime = 0;
-    gSuppressUntil = CFAbsoluteTimeGetCurrent() + 1.2;
-    MPLog(@"[hit-swallow] bundle=%@ frac=(%.2f,%.2f) cmd=%ld np=%@",
+
+    double now = CFAbsoluteTimeGetCurrent();
+    gTapTime       = 0;
+    gSuppressUntil = now + 1.5;
+    gBlockUntil    = now + 1.5;   // 这 1.5s 内不许把这个 App 拉到前台
+    MPLog(@"[hit] shield bundle=%@ frac=(%.2f,%.2f) cmd=%ld np=%@",
           gTapBundle ?: @"?", gTapFx, gTapFy, (long)cmd, gNowPlayingBundle ?: @"(无)");
 }
 
-- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gr {
-    MWEnsureConfig();
-    if (!gEnabled) return NO;
-    if (!gSwallow) return YES;   // 记录模式永远放行，不影响小组件自身交互
-
-    // 吃掉模式：只有落在控制区里的点击才吞，点封面/其它地方依旧可以打开 App
-    UIView *v = gr.view;
-    if (!v) return NO;
-    CGPoint p = [gr locationInView:v];
-    return MWActionFromPoint(p, v.bounds.size) >= 0;
-}
-
-// 必须显式收下这个触摸：桌面上的图标手势很多，不表态容易被别人的识别器抢走
-- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldReceiveTouch:(UITouch *)t {
-    return YES;
+// 长按：暂时撤掉接管，让用户能正常拖动 / 删除 / 编辑小组件
+- (void)handleShieldLongPress:(UILongPressGestureRecognizer *)gr {
+    if (gr.state != UIGestureRecognizerStateBegan) return;
+    gShieldOffUntil = CFAbsoluteTimeGetCurrent() + 6.0;
+    UIView *host = self.hostView;
+    UIView *shield = host ? objc_getAssociatedObject(host, &kMWShieldKey) : nil;
+    if ([shield isKindOfClass:[UIView class]]) ((UIView *)shield).hidden = YES;
+    MPLog(@"[shield] 长按：暂停接管 6 秒（可拖动/编辑小组件）");
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
 shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)o {
-    return YES;   // 不抢小组件/桌面自己的手势
+    return YES;
 }
 
 @end
 
-static void MWAttachToIconView(UIView *v) {
-    if (!v) return;
-    if (objc_getAssociatedObject(v, &kMWGRKey)) return;
+// 控制区的外接矩形（归一化 Region 的并集），遮盖层就盖这一块
+static CGRect MWRegionsUnionRect(CGSize sz) {
+    CGFloat x0 = 1, y0 = 1, x1 = 0, y1 = 0;
+    BOOL any = NO;
+    for (NSDictionary *r in gRegions) {
+        if (![r isKindOfClass:[NSDictionary class]]) continue;
+        CGFloat x = [r[@"x"] doubleValue];
+        CGFloat y = [r[@"y"] doubleValue];
+        CGFloat w = [r[@"w"] doubleValue];
+        CGFloat h = [r[@"h"] doubleValue];
+        if (x < x0) x0 = x;
+        if (y < y0) y0 = y;
+        if (x + w > x1) x1 = x + w;
+        if (y + h > y1) y1 = y + h;
+        any = YES;
+    }
+    if (!any || x1 <= x0 || y1 <= y0) return CGRectZero;
+    return CGRectMake(x0 * sz.width, y0 * sz.height,
+                      (x1 - x0) * sz.width, (y1 - y0) * sz.height);
+}
+
+static void MWEnsureShield(UIView *v) {
+    if (![v isKindOfClass:[UIView class]]) return;
+
+    CGSize sz = v.bounds.size;
+    if (sz.width < 60 || sz.height < 40) return;   // 不是小组件的尺度，忽略
+
+    UIView *shield = objc_getAssociatedObject(v, &kMWShieldKey);
+
+    // 已经装过：只更新位置和层级。layoutSubviews 调用很频繁，这条路必须够便宜，
+    // 不要在这里读配置、也不要再算包名。
+    if (shield) {
+        CGRect r = MWRegionsUnionRect(sz);
+        if (!CGRectIsEmpty(r) && !CGRectEqualToRect(shield.frame, r)) shield.frame = r;
+        if (shield.superview != v) [v addSubview:shield];
+        if (v.subviews.lastObject != shield) [v bringSubviewToFront:shield];
+        if (!gEnabled) { shield.hidden = YES; return; }
+        shield.hidden = (CFAbsoluteTimeGetCurrent() < gShieldOffUntil);
+        return;
+    }
 
     MWEnsureConfig();
     if (!gEnabled) return;
 
-    id icon = MWObj(v, @"icon");
     NSArray *cands = MWIconCandidates(v);
-    BOOL widgetish = MWIsWidgetIcon(icon);
-    if (!widgetish) {
-        // 图标类名里也可能直接带 Widget（不同系统版本容器类不一样），一并认掉
-        NSString *vn = MWClassName(v);
-        if ([vn rangeOfString:@"Widget"].location != NSNotFound) widgetish = YES;
-    }
-    BOOL wlMatch = MWCandsMatchList(cands, gBundleIDs);
-    BOOL should = gAttachAll ? YES : (gBundleIDs.count ? wlMatch : widgetish);
-    if (!should) return;
+    if (!MWIsMusicCands(cands)) return;   // 只接管音乐 App 的小组件
+
+    CGRect r = MWRegionsUnionRect(sz);
+    if (CGRectIsEmpty(r)) return;
+
+    shield = [[UIView alloc] initWithFrame:r];
+    shield.backgroundColor = [UIColor clearColor];
+    shield.opaque = NO;
+    shield.clearsContextBeforeDrawing = NO;
+    shield.autoresizingMask = UIViewAutoresizingNone;
+    shield.isAccessibilityElement = NO;
 
     MWTapProxy *proxy = [[MWTapProxy alloc] init];
-    UITapGestureRecognizer *gr = [[UITapGestureRecognizer alloc] initWithTarget:proxy action:@selector(handle:)];
-    gr.delegate = proxy;
-    gr.cancelsTouchesInView = NO;
-    gr.delaysTouchesEnded = NO;
-    [v addGestureRecognizer:gr];
-    objc_setAssociatedObject(v, &kMWGRKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    proxy.hostView = v;
 
-    MPLog(@"[attach] 已挂载 %@ (icon=%@, widget=%d, bundle=%@)",
-          MWClassName(v), MWClassName(icon), widgetish, MWBestBundle(cands) ?: @"?");
+    UITapGestureRecognizer *tap =
+        [[UITapGestureRecognizer alloc] initWithTarget:proxy action:@selector(handleShieldTap:)];
+    tap.delegate = proxy;
+    [shield addGestureRecognizer:tap];
+
+    UILongPressGestureRecognizer *lp =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:proxy action:@selector(handleShieldLongPress:)];
+    lp.minimumPressDuration = 0.55;
+    lp.delegate = proxy;
+    [shield addGestureRecognizer:lp];
+
+    objc_setAssociatedObject(shield, &kMWProxyKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [v addSubview:shield];
+    objc_setAssociatedObject(v, &kMWShieldKey, shield, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    MPLog(@"[shield] 已接管 %@ bundle=%@ rect=(%.0f,%.0f,%.0f,%.0f)",
+          MWClassName(v), MWBestBundle(cands) ?: @"?", r.origin.x, r.origin.y, r.size.width, r.size.height);
+}
+
+// 图标被复用（换成别的小组件/普通 App）时，把上一轮的遮盖层拆掉
+static void MWDetachShield(UIView *v) {
+    if (![v isKindOfClass:[UIView class]]) return;
+    UIView *shield = objc_getAssociatedObject(v, &kMWShieldKey);
+    if (![shield isKindOfClass:[UIView class]]) return;
+    [shield removeFromSuperview];
+    objc_setAssociatedObject(v, &kMWShieldKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    MPLog(@"[shield] 图标换内容，拆除旧遮盖层 %@", MWClassName(v));
 }
 
 // ======================= 8. URL 拦截核心 =======================
@@ -700,24 +823,89 @@ static BOOL mw_ls_openURLErr(id self, SEL _cmd, NSURL *url, NSDictionary *opts, 
     return orig_ls_openURLErr ? orig_ls_openURLErr(self, _cmd, url, opts, err) : NO;
 }
 
-// --- 9.3 SBIconView：桌面图标/小组件容器，用来挂观察手势 ---
+// --- 9.3 SBIconView：桌面图标/小组件容器，用来装遮盖层 ---
 
 static void (*orig_icon_didMove)(id, SEL);
 static void mw_icon_didMove(id self, SEL _cmd) {
     if (orig_icon_didMove) orig_icon_didMove(self, _cmd);
-    if ([self isKindOfClass:[UIView class]]) MWAttachToIconView((UIView *)self);
+    if ([self isKindOfClass:[UIView class]]) MWEnsureShield((UIView *)self);
 }
 
 static void (*orig_icon_layout)(id, SEL);
 static void mw_icon_layout(id self, SEL _cmd) {
     if (orig_icon_layout) orig_icon_layout(self, _cmd);
-    if ([self isKindOfClass:[UIView class]]) MWAttachToIconView((UIView *)self);
+    if ([self isKindOfClass:[UIView class]]) MWEnsureShield((UIView *)self);
 }
 
 static void (*orig_icon_setIcon)(id, SEL, id);
 static void mw_icon_setIcon(id self, SEL _cmd, id icon) {
+    if ([self isKindOfClass:[UIView class]]) MWDetachShield((UIView *)self);
     if (orig_icon_setIcon) orig_icon_setIcon(self, _cmd, icon);
-    if ([self isKindOfClass:[UIView class]]) MWAttachToIconView((UIView *)self);
+    if ([self isKindOfClass:[UIView class]]) MWEnsureShield((UIView *)self);
+}
+
+// 关键一步：落在控制区的触摸直接判给遮盖层。
+// 只靠「加个子视图」不够——SBIconView 若自己重写过 hitTest，会完全绕过子视图顺序。
+static id (*orig_icon_hitTest)(id, SEL, CGPoint, UIEvent *);
+static id mw_icon_hitTest(id self, SEL _cmd, CGPoint p, UIEvent *e) {
+    id r = orig_icon_hitTest ? orig_icon_hitTest(self, _cmd, p, e) : nil;
+    if (!gEnabled || ![self isKindOfClass:[UIView class]]) return r;
+    UIView *shield = objc_getAssociatedObject(self, &kMWShieldKey);
+    if (![shield isKindOfClass:[UIView class]]) return r;
+    if (shield.hidden || shield.superview != (UIView *)self) return r;
+    if (CGRectContainsPoint(shield.frame, p)) return shield;
+    return r;
+}
+
+// --- 9.3b 启动闸门：遮盖层万一没接到触摸，这里把「刚点过的那个 App」的启动掐掉 ---
+// 日志已经证明小组件不走 openURL，所以这几条「直接把 App 拉起来」的入口必须单独堵。
+
+static BOOL MWGate(NSString *bundle, NSString *src, NSString *detail) {
+    if (CFAbsoluteTimeGetCurrent() > gBlockUntil) return NO;
+    if (!MWTapOwnsTarget(bundle)) {
+        MPLog(@"[gate] %@ → %@ 不是刚点的小组件，放行", src, bundle ?: @"?");
+        return NO;
+    }
+    gBlockUntil = 0;
+    MPLog(@"[gate] 已拦下 %@ 启动 %@ %@", src, bundle ?: @"?", detail ?: @"");
+    return YES;
+}
+
+static NSString *MWIDStr(id v) {
+    if ([v isKindOfClass:[NSString class]]) return (NSString *)v;
+    if (v) return [v description];
+    return nil;
+}
+
+// FBSSystemService -openApplication:options:withResult:
+static void (*orig_fbs_open)(id, SEL, id, id, id);
+static void mw_fbs_open(id self, SEL _cmd, id app, id opts, id result) {
+    if (MWGate(MWIDStr(app), @"FBSSystemService", nil)) return;
+    if (orig_fbs_open) orig_fbs_open(self, _cmd, app, opts, result);
+}
+
+// FBSOpenApplicationService -openApplication:withOptions:clientHandle:completion:
+static void (*orig_fbo_open)(id, SEL, id, id, id, id);
+static void mw_fbo_open(id self, SEL _cmd, id app, id opts, id handle, id completion) {
+    if (MWGate(MWIDStr(app), @"FBSOpenApplicationService", nil)) {
+        if (completion) ((void (^)(id, id))completion)(nil, nil);
+        return;
+    }
+    if (orig_fbo_open) orig_fbo_open(self, _cmd, app, opts, handle, completion);
+}
+
+// UIApplication -_launchApplicationWithIdentifier:suspended:
+static void (*orig_launchApp)(id, SEL, id, BOOL);
+static void mw_launchApp(id self, SEL _cmd, id ident, BOOL suspended) {
+    if (MWGate(MWIDStr(ident), @"UIApplication._launchApplication", nil)) return;
+    if (orig_launchApp) orig_launchApp(self, _cmd, ident, suspended);
+}
+
+// LSApplicationWorkspace -openApplicationWithBundleID:
+static BOOL (*orig_ls_openApp)(id, SEL, id);
+static BOOL mw_ls_openApp(id self, SEL _cmd, id bid) {
+    if (MWGate(MWIDStr(bid), @"LSWorkspace.openApplication", nil)) return NO;
+    return orig_ls_openApp ? orig_ls_openApp(self, _cmd, bid) : NO;
 }
 
 // --- 9.4 安装 ---
@@ -757,6 +945,17 @@ static void MWInstallAllHooks(void) {
     MWInstallHook("SBIconView", "didMoveToWindow", (IMP)mw_icon_didMove, (IMP *)&orig_icon_didMove);
     MWInstallHook("SBIconView", "layoutSubviews", (IMP)mw_icon_layout, (IMP *)&orig_icon_layout);
     MWInstallHook("SBIconView", "setIcon:", (IMP)mw_icon_setIcon, (IMP *)&orig_icon_setIcon);
+    MWInstallHook("SBIconView", "hitTest:withEvent:", (IMP)mw_icon_hitTest, (IMP *)&orig_icon_hitTest);
+
+    // 启动闸门（这些入口和 URL 无关，是直接「把 App 拉起来」的路径）
+    MWInstallHook("FBSSystemService", "openApplication:options:withResult:",
+                  (IMP)mw_fbs_open, (IMP *)&orig_fbs_open);
+    MWInstallHook("FBSOpenApplicationService", "openApplication:withOptions:clientHandle:completion:",
+                  (IMP)mw_fbo_open, (IMP *)&orig_fbo_open);
+    MWInstallHook("UIApplication", "_launchApplicationWithIdentifier:suspended:",
+                  (IMP)mw_launchApp, (IMP *)&orig_launchApp);
+    MWInstallHook("LSApplicationWorkspace", "openApplicationWithBundleID:",
+                  (IMP)mw_ls_openApp, (IMP *)&orig_ls_openApp);
 
     // 兜底：类名换了的系统上，把带 Widget 字样的图标容器类也挂上
     const char *extra[] = { "SBHWidgetIconView", "SBWidgetIconView" };
