@@ -2,13 +2,8 @@ Package: com.mwdt.musicwidgetdirect
 Name: MusicWidgetDirect
 Version: 0.1.0
 Architecture: iphoneos-arm64
-Description: 让第三方音乐桌面小组件的播放/上一首/下一首按钮直接在桌面生效，不再跳转 App。
+Description: 让第三方音乐桌面小组件的播放/上一首/下一首按钮在桌面直接生效，不再跳转 App。
 Maintainer: mwdt
 Author: mwdt
 Section: Tweaks
 Depends: mobilesubstrate, firmware (>= 15.0)
-
-# 要点：
-#  · Package 是唯一标识，定了就别改，改了对系统来说就是另一个插件。
-#  · Version 是 CI 读的唯一版本来源，产物文件名由它生成，必须和 Version.h 的 MY_VERSION 一致。
-#  · Architecture 写 iphoneos-arm64（rootless 由 Theos 自动改写）。
