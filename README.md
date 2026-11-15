@@ -35,8 +35,8 @@
 | 层 | 做法 |
 |---|---|
 | ① 按钮条 | 在音乐小组件的控制区里摆 3 个**透明按钮**（左/中/右 = 上一首/播放暂停/下一首），按钮的 `tag` 就是命令号。点中即发 MediaRemote 命令，没有任何坐标换算 |
-| ② `hitTest` 只给按钮 | 覆盖层的 `hitTest` 在按钮范围内返回按钮，**其它位置返回 nil**，触摸穿透给小组件 → 点封面照常打开 App，不需要插件代劳 |
-| ③ 手势闸门 | 祖先的点击识别器用 `gestureRecognizerShouldBegin:` 挡，**只挡落在按钮上的 tap**，长按/拖动一律放行（还能正常编辑小组件） |
+| ② `hitTest` 只给按钮 | 按钮范围内返回按钮，其它位置返回一个**空兜底控件** → 触摸既不会漏给小组件的远程视图，也不会漏给系统手势 |
+| ③ 关掉图标点按 | 把小组件图标视图上的 `UITapGestureRecognizer` 关掉（**只关这一个小组件**，桌面 App 图标一个都不碰）。`gestureRecognizerShouldBegin:` 在真机上根本不会被调用，0.5 就是死在这里 |
 | ④ 启动闸门 + URL | 万一还漏，掐掉 1.5 秒内同一个 App 的启动；老系统走 `openURL` 的照旧吞掉 |
 
 按钮点击 → 私有框架 `MediaRemote` 发命令（0=播放、1=暂停、2=播放暂停、4=下一首、
@@ -47,8 +47,9 @@
 - **只接管音乐 App 的小组件**（内置酷狗、QQ 音乐、网易云、汽水、酷我、咪咕、Spotify、
   Apple Music 等主包名），而且必须是「真小组件」：宽 ≥130 且 icon 是 `SBWidgetIcon`。
   普通 App 图标、资源库堆叠、天气/日历/支付宝小组件一个像素都不碰。
-- **点封面区 / 上半部分** → 触摸穿透，走小组件原本的行为（打开 App）。想编辑小组件
-  直接长按封面区即可。
+- **点封面区 / 上半部分** → 被兜底控件吃掉，什么也不做（不会打开 App）。想进 App
+  就点桌面上那个 App 图标；想编辑小组件长按封面区即可。
+  这是「彻底不跳」的代价：小组件整块的触摸都由插件接管了。
 
 ## 3. 目录
 
@@ -75,9 +76,9 @@ MusicWidgetDirect/
 1. 装 deb → `respring`
 2. 打开音乐 App 放一首歌，回到桌面
 3. 点小组件的播放/暂停、上一首、下一首 → **原地生效**，App 不起来
-4. 点封面、点小组件其它区域 → 正常打开 App（这是你要的，别的地方还能进 App）
+4. 点封面、点小组件其它区域 → 不会打开 App（也不会有任何反应）
 
-不用配置就能用。0.5 默认行为：**音乐 App 的小组件**、**下半部三等分区域**（左/中/右 = 上一首/播放暂停/下一首）放的是透明按钮，点了原地生效、不跳 App；点上半部分（封面区）照常打开 App。
+不用配置就能用。0.5 默认行为：**音乐 App 的小组件**、**下半部三等分区域**（左/中/右 = 上一首/播放暂停/下一首）放的是透明按钮，点了原地生效、不跳 App；点上半部分（封面区）不会打开 App。
 
 要编辑/拖动小组件，长按封面区即可（长按不吃接管）。
 
@@ -210,7 +211,7 @@ MusicWidgetDirect/
 ```bash
 # 看插件有没有被注入
 tail -20 /var/mobile/Library/Logs/MusicWidgetDirect.log
-# 期望开头有：==== MusicWidgetDirect 0.5.0 载入 (pid=..., SpringBoard) ====
+# 期望开头有：==== MusicWidgetDirect 0.6.0 载入 (pid=..., SpringBoard) ====
 
 # 卸载
 dpkg -r com.mwdt.musicwidgetdirect && killall -9 SpringBoard
@@ -229,7 +230,7 @@ echo "ghp_xxxx" > ~/.gh_token && chmod 600 ~/.gh_token
 
 # 发版
 grep -E '^Version:' control; grep -E 'MY_VERSION' Version.h   # 两个版本号必须一致
-python3 push2.py "0.5.0: 按钮条 + 手势闸门" Makefile control MusicWidgetDirect.plist Tweak.mm Version.h .github/workflows/build.yml
+python3 push2.py "0.6.0: 按钮条 + 整块兜底" Makefile control MusicWidgetDirect.plist Tweak.mm Version.h .github/workflows/build.yml
 
 # 取包
 gh run list --repo <owner/repo> --limit 1
@@ -241,7 +242,7 @@ gh run download <run-id> --repo <owner/repo> -D out
 
 ```bash
 export PATH=/var/jb/usr/bin:$PATH
-dpkg -i out/pkg-rootless/MusicWidgetDirect-0.5.0-rootless-arm64-arm64e.deb
+dpkg -i out/pkg-rootless/MusicWidgetDirect-0.6.0-rootless-arm64-arm64e.deb
 killall -9 SpringBoard
 ```
 

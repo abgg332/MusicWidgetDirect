@@ -577,6 +577,7 @@ static BOOL gMaintaining = NO;
 @interface MWShieldView : UIView
 @property (nonatomic, weak) UIView *hostView;
 @property (nonatomic, strong) NSMutableArray<MWShieldButton *> *buttons;
+@property (nonatomic, strong) UIControl *blanket;   // 整块兜底：吞掉触摸但什么都不做
 @end
 
 @implementation MWShieldView
@@ -591,6 +592,13 @@ static BOOL gMaintaining = NO;
         self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         self.isAccessibilityElement = NO;
         _buttons = [NSMutableArray array];
+
+        // 整块兜底：小组件里任何位置（封面、歌词、按钮）都不许把触摸漏给远程视图，
+        // 否则远程视图里的 Link 一样会把 App 拉起来——这就是 0.5 还跳的原因之一。
+        _blanket = [[UIControl alloc] initWithFrame:frame];
+        _blanket.backgroundColor = [UIColor clearColor];
+        _blanket.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [self addSubview:_blanket];
     }
     return self;
 }
@@ -606,7 +614,7 @@ static BOOL gMaintaining = NO;
         UIView *r = [b hitTest:q withEvent:event];
         return r ?: b;
     }
-    return nil;
+    return self.blanket;   // 按钮之外也不漏，一律由兜底控件吃掉（什么都不做）
 }
 
 // 按当前配置的 Regions 摆按钮；Region 变了（热加载）也能跟着变
@@ -684,6 +692,44 @@ static BOOL MWIsWidgetHost(UIView *v) {
     return YES;
 }
 
+static char kMWDisabledKey;
+
+// 把图标视图上「点一下开 App」的点击识别器关掉。
+// 这是唯一被真机验证过能挡住「SpringBoard 把 App 拉到前台」的办法：
+//   · 0.4 的日志里，凡是落在按钮区的点击，关掉之后都没再出现系统启动；
+//   · 0.5 换回 gestureRecognizerShouldBegin:，结果那条根本没被调用（日志里没有 [gr] 行），
+//     因为 SBIconTapGestureRecognizer 的 delegate 不是 SBIconView 自己。
+// 现在只对「真小组件」的图标视图关，普通 App 图标不再受影响。
+static void MWDisableTapRecognizers(UIView *v) {
+    if (![v isKindOfClass:[UIView class]]) return;
+    NSMutableArray *disabled = [NSMutableArray array];
+    NSArray *prev = objc_getAssociatedObject(v, &kMWDisabledKey);
+    if ([prev isKindOfClass:[NSArray class]]) [disabled addObjectsFromArray:prev];
+    BOOL changed = NO;
+    for (UIGestureRecognizer *g in [v gestureRecognizers]) {
+        if (![g isKindOfClass:[UITapGestureRecognizer class]]) continue;
+        if (!g.enabled) continue;
+        g.enabled = NO;
+        [disabled addObject:g];
+        changed = YES;
+    }
+    if (changed) {
+        objc_setAssociatedObject(v, &kMWDisabledKey, disabled, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static void MWRestoreTapRecognizers(UIView *v) {
+    NSArray *disabled = objc_getAssociatedObject(v, &kMWDisabledKey);
+    if (![disabled isKindOfClass:[NSArray class]] || !disabled.count) return;
+    for (UIGestureRecognizer *g in disabled) g.enabled = YES;
+    objc_setAssociatedObject(v, &kMWDisabledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static NSInteger MWDisabledTapCount(UIView *v) {
+    NSArray *a = objc_getAssociatedObject(v, &kMWDisabledKey);
+    return [a isKindOfClass:[NSArray class]] ? (NSInteger)a.count : 0;
+}
+
 static void MWAttachShield(UIView *v);
 
 // 拆掉覆盖层（图标换成别的内容时）
@@ -693,6 +739,7 @@ static void MWDetachShield(UIView *v) {
     if (![old isKindOfClass:[MWShieldView class]]) return;
     objc_setAssociatedObject(v, &kMWShieldKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [old removeFromSuperview];
+    MWRestoreTapRecognizers(v);
     MPLog(@"[shield] 拆除覆盖层 %@", MWClassName(v));
 }
 
@@ -722,10 +769,12 @@ static void MWAttachShield(UIView *v) {
         objc_setAssociatedObject(v, &kMWShieldKey, shield, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [shield layoutButtons];
         [v addSubview:shield];
+        MWDisableTapRecognizers(v);      // 关键：不让 SpringBoard 的图标点按生效
 
-        MPLog(@"[shield] 已接管 %@ bundle=%@ bounds=(%.0f,%.0f) 按钮=%lu",
+        MPLog(@"[shield] 已接管 %@ bundle=%@ bounds=(%.0f,%.0f) 按钮=%lu 已关点按=%ld",
               MWClassName(v), MWBestBundle(cands) ?: @"?",
-              v.bounds.size.width, v.bounds.size.height, (unsigned long)shield.buttons.count);
+              v.bounds.size.width, v.bounds.size.height,
+              (unsigned long)shield.buttons.count, (long)MWDisabledTapCount(v));
         gMaintaining = NO;
         return;
     }
@@ -737,6 +786,7 @@ static void MWAttachShield(UIView *v) {
     }
     shield.hidden = (CFAbsoluteTimeGetCurrent() < gShieldOffUntil);
     if (shield.superview != v) [v insertSubview:shield atIndex:v.subviews.count];
+    MWDisableTapRecognizers(v);      // 系统可能在复用图标时把手势重新打开，这里补一刀
     gMaintaining = NO;
 }
 
@@ -889,15 +939,27 @@ static void mw_icon_setIcon(id self, SEL _cmd, id icon) {
     if (![self isKindOfClass:[UIView class]]) return;
     UIView *v = (UIView *)self;
 
-    // 图标视图会被复用。只有「装上来的新内容不再是音乐小组件」时才拆，
-    // 同一小组件刷新（bundle 没变）就保持不动 —— 0.4 在这里无脑拆，导致
-    // 「接管→拆除」来回刷屏，主线程被拖死（用户反馈的整屏卡住）。
+    // 图标视图会被复用。只有「确认换成了别的东西」才拆：
+    //   · 0.4 在这里无脑拆，导致「接管→拆除」来回刷屏，主线程被拖死（整屏卡住）；
+    //   · 0.5 虽然收敛了条件，但小组件刷新时 icon 短暂为空，cands 也是空，
+    //     于是每次都拆一下再接回来 —— 中间那段空档正好让点击漏到了 SpringBoard。
     MWShieldView *shield = objc_getAssociatedObject(v, &kMWShieldKey);
+    if (icon == nil) {                       // 只是清空，不是换内容
+        MWAttachShield(v);
+        return;
+    }
     if (![shield isKindOfClass:[MWShieldView class]]) {
         MWAttachShield(v);
         return;
     }
-    if (!MWIsWidgetHost(v) || !MWIsMusicCands(MWIconCandidates(v))) MWDetachShield(v);
+    if (!MWIsWidgetHost(v)) { MWDetachShield(v); return; }
+
+    NSArray *cands = MWIconCandidates(v);
+    if (cands.count && !MWIsMusicCands(cands)) {   // cands 为空 = 正在刷新，保持不动
+        MWDetachShield(v);
+        return;
+    }
+    MWAttachShield(v);
 }
 
 // 落在按钮上的触摸直接判给按钮。只靠「加个子视图」不够 —— SBIconView 若自己重写过
