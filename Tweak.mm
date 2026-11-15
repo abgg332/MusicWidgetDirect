@@ -649,13 +649,13 @@ static void MWEnsureShield(UIView *v) {
         if (!CGRectIsEmpty(r) && !CGRectEqualToRect(shield.frame, r)) shield.frame = r;
         if (shield.superview != v) [v addSubview:shield];
         if (v.subviews.lastObject != shield) [v bringSubviewToFront:shield];
-        if (!gEnabled) { shield.hidden = YES; return; }
+        if (!gEnabled || !gSwallow) { shield.hidden = YES; return; }
         shield.hidden = (CFAbsoluteTimeGetCurrent() < gShieldOffUntil);
         return;
     }
 
     MWEnsureConfig();
-    if (!gEnabled) return;
+    if (!gEnabled || !gSwallow) return;   // SwallowTouch=false 时不装遮盖层，只留 URL 兜底
 
     NSArray *cands = MWIconCandidates(v);
     if (!MWIsMusicCands(cands)) return;   // 只接管音乐 App 的小组件
