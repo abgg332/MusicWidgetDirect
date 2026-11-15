@@ -26,13 +26,14 @@
 `openURL`，小组件自己（或 SpringBoard 的图标手势）直接把 App 拉起来。所以拦
 URL 等于拦空气 —— 真机日志里 `[tap]`、`[hit]`、`[cmd]` 全有，`[url]` 一条没有。
 
-0.3 改成三层，从「物理隔离」到「兜底」：
+0.4 一共四道，全部要过：
 
 | 层 | 做法 | 效果 |
 |---|---|---|
-| ① 遮盖层 | 在音乐小组件的控制区上盖一层**透明视图**，`hitTest` 直接返回它 | 触摸根本到不了小组件，App 起不来，最可靠 |
-| ② 启动闸门 | 万一触摸漏到 SpringBoard 手势上，在 `FBSSystemService` / `FBSOpenApplicationService` / `_launchApplication` 这些入口把「刚点过的那一个 App」的启动掐掉（只掐 1.5 秒内、只掐同一个 App） | 双保险 |
-| ③ URL 兜底 | 老系统上仍然走 `openURL` 的，照旧吞掉 | 兼容 |
+| ① 遮盖层 | 把音乐小组件**整块**盖上一层透明视图，`hitTest` 直接返回它 | 小组件的远程视图收不到触摸 |
+| ② 关掉图标点按手势 | 把图标视图上「点一下开 App」的 `UITapGestureRecognizer` 关掉；`gestureRecognizerShouldBegin:` 再挡一层 | **关键**：祖先视图的手势照样能收到子视图里的触摸，只盖遮盖层是挡不住的（0.3.0 就死在这一步） |
+| ③ 启动闸门 | `FBSSystemService` / `FBSOpenApplicationService` / `LSApplicationWorkspace` 的所有打开变体 / `iconTapped:` | 万一还漏，掐掉 1.5 秒内同一个 App 的启动 |
+| ④ URL 兜底 | 老系统上仍然走 `openURL` 的，照旧吞掉 | 兼容 |
 
 遮盖层自己接点击 → 用私有框架 `MediaRemote` 发命令（0=播放、1=暂停、2=播放暂停、
 4=下一首、5=上一首），和耳机线控、锁屏控制中心是**同一套指令**，App 看来和真按了按钮没区别。
@@ -41,8 +42,8 @@ URL 等于拦空气 —— 真机日志里 `[tap]`、`[hit]`、`[cmd]` 全有，
 
 - **只接管音乐 App 的小组件**（内置酷狗、QQ 音乐、网易云、汽水、酷我、咪咕、Spotify、
   Apple Music 等主包名）。天气、日历、支付宝这些小部件一个像素都不碰。
-- **长按遮盖层 0.55 秒** → 暂停接管 6 秒，这时可以正常拖动/编辑/删除小组件。
-  也可以长按小组件上半部分（封面区）进入编辑。
+- **点封面区（控制区之外）** → 插件自己把 App 打开，和原来手感一致。
+- **长按小组件 0.55 秒** → 暂停接管 6 秒，方便拖动/编辑/删除。
 
 ## 3. 目录
 
@@ -163,9 +164,10 @@ MusicWidgetDirect/
 装好第一次 respring 后，日志里应该出现这三类行：
 
 ```
-[shield] 已接管 SBIconView bundle=com.kugou.kugou1002.KGWidget rect=(0,101,364,83)
+[shield] 已接管 SBIconView bundle=com.kugou.kugou1002.KGWidget bounds=(364,184) 手势=<UITapGestureRecognizer(已关)>
 [hook] 已挂 SBIconView -hitTest:withEvent:
-[hook] 已挂 FBSSystemService -openApplication:options:withResult:
+[hook] 已挂 SBIconView -gestureRecognizerShouldBegin:
+[hook] 已挂 SBIconController -iconTapped:
 ```
 
 点一下按钮之后，成功的样子是：
@@ -204,7 +206,7 @@ MusicWidgetDirect/
 ```bash
 # 看插件有没有被注入
 tail -20 /var/mobile/Library/Logs/MusicWidgetDirect.log
-# 期望开头有：==== MusicWidgetDirect 0.3.0 载入 (pid=..., SpringBoard) ====
+# 期望开头有：==== MusicWidgetDirect 0.4.0 载入 (pid=..., SpringBoard) ====
 
 # 卸载
 dpkg -r com.mwdt.musicwidgetdirect && killall -9 SpringBoard
@@ -223,7 +225,7 @@ echo "ghp_xxxx" > ~/.gh_token && chmod 600 ~/.gh_token
 
 # 发版
 grep -E '^Version:' control; grep -E 'MY_VERSION' Version.h   # 两个版本号必须一致
-python3 push2.py "0.3.0: 遮盖层接管 + 启动闸门" Makefile control MusicWidgetDirect.plist Tweak.mm Version.h .github/workflows/build.yml
+python3 push2.py "0.4.0: 关掉图标点按手势 + 整块遮盖" Makefile control MusicWidgetDirect.plist Tweak.mm Version.h .github/workflows/build.yml
 
 # 取包
 gh run list --repo <owner/repo> --limit 1
@@ -235,7 +237,7 @@ gh run download <run-id> --repo <owner/repo> -D out
 
 ```bash
 export PATH=/var/jb/usr/bin:$PATH
-dpkg -i out/pkg-rootless/MusicWidgetDirect-0.3.0-rootless-arm64-arm64e.deb
+dpkg -i out/pkg-rootless/MusicWidgetDirect-0.4.0-rootless-arm64-arm64e.deb
 killall -9 SpringBoard
 ```
 

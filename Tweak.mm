@@ -390,17 +390,6 @@ static NSArray *MWIconCandidates(id iconView) {
     return out;
 }
 
-static BOOL MWIsWidgetIcon(id icon) {
-    if (!icon) return NO;
-    NSString *cn = MWClassName(icon);
-    if ([cn rangeOfString:@"Widget"].location != NSNotFound) return YES;
-    if ([icon respondsToSelector:@selector(activeWidget)]) return YES;
-    if ([icon respondsToSelector:@selector(widgets)]) return YES;
-    // 有的版本图标类叫 SBLeafIcon，但是小组件类型的 icon 会有 SBIconTypeWidget 之类的类型串
-    id t = MWObj(icon, @"iconType");
-    if (t && [[t description] rangeOfString:@"Widget" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
-    return NO;
-}
 
 static NSString *MWBestBundle(NSArray *cands) {
     NSString *best = nil;
@@ -553,6 +542,33 @@ static char kMWShieldKey;
 static char kMWProxyKey;
 static double gShieldOffUntil = 0;
 
+// 从小组件包名反推宿主 App：com.a.b.KGWidget → com.a.b，且必须在音乐前缀表里
+static NSString *MWHostBundleFromCands(NSArray *cands) {
+    for (NSString *c in cands) {
+        if (![c isKindOfClass:[NSString class]]) continue;
+        NSRange r = [c rangeOfString:@"." options:NSBackwardsSearch];
+        if (r.location == NSNotFound || r.location == 0) continue;
+        NSString *host = [c substringToIndex:r.location];
+        if (MWIsMusicCands(@[ host ])) return host;
+    }
+    return nil;
+}
+
+// 我们自己替小组件把 App 打开（点封面区时用，保持原来的手感）
+static void MWOpenHostApp(NSString *bid) {
+    if (!bid.length) return;
+    Class c = objc_getClass("LSApplicationWorkspace");
+    id ws = c ? ((id (*)(id, SEL))objc_msgSend)((id)c, sel_registerName("defaultWorkspace")) : nil;
+    SEL s = sel_registerName("openApplicationWithBundleID:");
+    if (ws && [ws respondsToSelector:s]) {
+        gBlockUntil = 0;   // 这次是我们自己要开，绕过闸门
+        ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, s, bid);
+        MPLog(@"[open] 按原来的行为打开 App: %@", bid);
+    } else {
+        MPLog(@"[open] 打不开 %@（没有 LSApplicationWorkspace）", bid);
+    }
+}
+
 @interface MWTapProxy : NSObject <UIGestureRecognizerDelegate>
 @property (nonatomic, weak) UIView *hostView;
 @end
@@ -579,12 +595,19 @@ static double gShieldOffUntil = 0;
     gSuppressUntil = 0;
 
     NSInteger cmd = MWActionFromPoint(p, sz);
-    NSString *via = @"region";
-    if (cmd < 0) { cmd = gFallbackCmd; via = @"fallback"; }
 
-    MPLog(@"[tap] bundle=%@ frac=(%.2f,%.2f) size=(%.0f,%.0f) icon=%@ cmd=%ld via=%@",
+    // 落在控制区外（封面/歌词区）：按原来的行为打开 App，不掉手感
+    if (cmd < 0) {
+        MPLog(@"[tap] bundle=%@ frac=(%.2f,%.2f) 非控制区 → 打开 App",
+              gTapBundle ?: @"(未知)", gTapFx, gTapFy);
+        MWOpenHostApp(MWHostBundleFromCands(cands));
+        gTapTime = 0;
+        return;
+    }
+
+    MPLog(@"[tap] bundle=%@ frac=(%.2f,%.2f) size=(%.0f,%.0f) icon=%@ cmd=%ld via=region",
           gTapBundle ?: @"(未知)", gTapFx, gTapFy, sz.width, sz.height,
-          MWClassName(MWObj(host, @"icon")), (long)cmd, via);
+          MWClassName(MWObj(host, @"icon")), (long)cmd);
 
     MWSendCommand((int)cmd);
 
@@ -613,25 +636,37 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)o {
 
 @end
 
-// 控制区的外接矩形（归一化 Region 的并集），遮盖层就盖这一块
-static CGRect MWRegionsUnionRect(CGSize sz) {
-    CGFloat x0 = 1, y0 = 1, x1 = 0, y1 = 0;
-    BOOL any = NO;
-    for (NSDictionary *r in gRegions) {
-        if (![r isKindOfClass:[NSDictionary class]]) continue;
-        CGFloat x = [r[@"x"] doubleValue];
-        CGFloat y = [r[@"y"] doubleValue];
-        CGFloat w = [r[@"w"] doubleValue];
-        CGFloat h = [r[@"h"] doubleValue];
-        if (x < x0) x0 = x;
-        if (y < y0) y0 = y;
-        if (x + w > x1) x1 = x + w;
-        if (y + h > y1) y1 = y + h;
-        any = YES;
+static char kMWDisabledKey;
+
+static void MWDisableTapRecognizers(UIView *v) {
+    if (![v isKindOfClass:[UIView class]]) return;
+    NSArray *prev = objc_getAssociatedObject(v, &kMWDisabledKey);
+    NSMutableArray *disabled = prev ? [prev mutableCopy] : [NSMutableArray array];
+    BOOL changed = NO;
+    for (UIGestureRecognizer *g in [v gestureRecognizers]) {
+        if (![g isKindOfClass:[UITapGestureRecognizer class]]) continue;
+        if (!g.enabled) continue;                    // 已经是关的
+        if ([disabled containsObject:g]) continue;
+        g.enabled = NO;                              // 关掉「点一下开 App」
+        [disabled addObject:g];
+        changed = YES;
     }
-    if (!any || x1 <= x0 || y1 <= y0) return CGRectZero;
-    return CGRectMake(x0 * sz.width, y0 * sz.height,
-                      (x1 - x0) * sz.width, (y1 - y0) * sz.height);
+    if (changed) objc_setAssociatedObject(v, &kMWDisabledKey, disabled, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void MWRestoreTapRecognizers(UIView *v) {
+    NSArray *disabled = objc_getAssociatedObject(v, &kMWDisabledKey);
+    if (![disabled isKindOfClass:[NSArray class]] || !disabled.count) return;
+    for (UIGestureRecognizer *g in disabled) g.enabled = YES;
+    objc_setAssociatedObject(v, &kMWDisabledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static NSString *MWGestureSummary(UIView *v) {
+    NSMutableArray *a = [NSMutableArray array];
+    for (UIGestureRecognizer *g in [v gestureRecognizers]) {
+        [a addObject:[NSString stringWithFormat:@"%@%s", MWClassName(g), g.enabled ? "" : "(已关)"]];
+    }
+    return a.count ? [a componentsJoinedByString:@","] : @"(无)";
 }
 
 static void MWEnsureShield(UIView *v) {
@@ -645,10 +680,11 @@ static void MWEnsureShield(UIView *v) {
     // 已经装过：只更新位置和层级。layoutSubviews 调用很频繁，这条路必须够便宜，
     // 不要在这里读配置、也不要再算包名。
     if (shield) {
-        CGRect r = MWRegionsUnionRect(sz);
+        CGRect r = v.bounds;
         if (!CGRectIsEmpty(r) && !CGRectEqualToRect(shield.frame, r)) shield.frame = r;
         if (shield.superview != v) [v addSubview:shield];
         if (v.subviews.lastObject != shield) [v bringSubviewToFront:shield];
+        MWDisableTapRecognizers(v);
         if (!gEnabled || !gSwallow) { shield.hidden = YES; return; }
         shield.hidden = (CFAbsoluteTimeGetCurrent() < gShieldOffUntil);
         return;
@@ -660,14 +696,13 @@ static void MWEnsureShield(UIView *v) {
     NSArray *cands = MWIconCandidates(v);
     if (!MWIsMusicCands(cands)) return;   // 只接管音乐 App 的小组件
 
-    CGRect r = MWRegionsUnionRect(sz);
-    if (CGRectIsEmpty(r)) return;
-
-    shield = [[UIView alloc] initWithFrame:r];
+    // 整块盖住：小组件的内容视图（远程视图）和 SpringBoard 的图标点击手势都碰不到这块区域。
+    // 控制区内的点击发媒体命令，控制区外的点击由我们自己把 App 打开。
+    shield = [[UIView alloc] initWithFrame:v.bounds];
     shield.backgroundColor = [UIColor clearColor];
     shield.opaque = NO;
     shield.clearsContextBeforeDrawing = NO;
-    shield.autoresizingMask = UIViewAutoresizingNone;
+    shield.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     shield.isAccessibilityElement = NO;
 
     MWTapProxy *proxy = [[MWTapProxy alloc] init];
@@ -688,17 +723,24 @@ static void MWEnsureShield(UIView *v) {
     [v addSubview:shield];
     objc_setAssociatedObject(v, &kMWShieldKey, shield, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    MPLog(@"[shield] 已接管 %@ bundle=%@ rect=(%.0f,%.0f,%.0f,%.0f)",
-          MWClassName(v), MWBestBundle(cands) ?: @"?", r.origin.x, r.origin.y, r.size.width, r.size.height);
+    MWDisableTapRecognizers(v);
+
+    MPLog(@"[shield] 已接管 %@ bundle=%@ bounds=(%.0f,%.0f) 手势=%@",
+          MWClassName(v), MWBestBundle(cands) ?: @"?", v.bounds.size.width, v.bounds.size.height,
+          MWGestureSummary(v));
 }
 
-// 图标被复用（换成别的小组件/普通 App）时，把上一轮的遮盖层拆掉
+// 图标被复用（换成别的小组件/普通 App）时，把上一轮的遮盖层拆掉，并把手势还回去
 static void MWDetachShield(UIView *v) {
     if (![v isKindOfClass:[UIView class]]) return;
     UIView *shield = objc_getAssociatedObject(v, &kMWShieldKey);
-    if (![shield isKindOfClass:[UIView class]]) return;
+    if (![shield isKindOfClass:[UIView class]]) {
+        MWRestoreTapRecognizers(v);
+        return;
+    }
     [shield removeFromSuperview];
     objc_setAssociatedObject(v, &kMWShieldKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    MWRestoreTapRecognizers(v);
     MPLog(@"[shield] 图标换内容，拆除旧遮盖层 %@", MWClassName(v));
 }
 
@@ -857,6 +899,33 @@ static id mw_icon_hitTest(id self, SEL _cmd, CGPoint p, UIEvent *e) {
     return r;
 }
 
+// 双保险：万一某个识别器被系统重新打开，也让它在「我们接管的那块」上不要开始
+static BOOL MWGRShouldBeginImpl(id self, SEL _cmd, UIGestureRecognizer *gr, IMP origImp) {
+    BOOL r = origImp ? ((BOOL (*)(id, SEL, UIGestureRecognizer *))origImp)(self, _cmd, gr) : YES;
+    if (!r) return NO;
+    if (!gEnabled || !gSwallow) return r;
+    if (![gr isKindOfClass:[UITapGestureRecognizer class]]) return r;
+    UIView *gv = [gr view];
+    if (![gv isKindOfClass:[UIView class]]) return r;
+    CGPoint p = [gr locationInView:gv];
+    UIView *hit = [gv hitTest:p withEvent:nil];
+    if (hit && objc_getAssociatedObject(hit, &kMWProxyKey)) {
+        MPLogD(@"[gr] 阻止 %@ 在接管区开始", MWClassName(gr));
+        return NO;
+    }
+    return r;
+}
+
+static BOOL (*orig_grShouldBegin)(id, SEL, UIGestureRecognizer *);
+static BOOL mw_grShouldBegin(id self, SEL _cmd, UIGestureRecognizer *gr) {
+    return MWGRShouldBeginImpl(self, _cmd, gr, (IMP)orig_grShouldBegin);
+}
+
+static BOOL (*orig_grShouldBegin2)(id, SEL, UIGestureRecognizer *);
+static BOOL mw_grShouldBegin2(id self, SEL _cmd, UIGestureRecognizer *gr) {
+    return MWGRShouldBeginImpl(self, _cmd, gr, (IMP)orig_grShouldBegin2);
+}
+
 // --- 9.3b 启动闸门：遮盖层万一没接到触摸，这里把「刚点过的那个 App」的启动掐掉 ---
 // 日志已经证明小组件不走 openURL，所以这几条「直接把 App 拉起来」的入口必须单独堵。
 
@@ -908,6 +977,42 @@ static BOOL mw_ls_openApp(id self, SEL _cmd, id bid) {
     return orig_ls_openApp ? orig_ls_openApp(self, _cmd, bid) : NO;
 }
 
+// 兜底：图标点击最终会汇报给 SBIconController，这里再拦一道
+static void (*orig_iconTapped)(id, SEL, id);
+static void mw_iconTapped(id self, SEL _cmd, id icon) {
+    if (gEnabled) {
+        BOOL shielded = [icon isKindOfClass:[UIView class]] &&
+                        objc_getAssociatedObject(icon, &kMWShieldKey) != nil;
+        BOOL sameTap = (CFAbsoluteTimeGetCurrent() < gBlockUntil && gTapCands.count &&
+                        MWCandsMatchList(MWIconCandidates(icon), gTapCands));
+        if (shielded || sameTap) {
+            MPLog(@"[gate] 拦下 iconTapped: %@", MWClassName(icon));
+            return;
+        }
+    }
+    if (orig_iconTapped) orig_iconTapped(self, _cmd, icon);
+}
+
+// LSApplicationWorkspace 还有几个带 options 的变体，激活/打开都可能走这些
+static BOOL (*orig_ls_openAppOpts)(id, SEL, id, id);
+static BOOL mw_ls_openAppOpts(id self, SEL _cmd, id bid, id opts) {
+    if (MWGate(MWIDStr(bid), @"LSWorkspace.openApplication:options:", nil)) return NO;
+    return orig_ls_openAppOpts ? orig_ls_openAppOpts(self, _cmd, bid, opts) : NO;
+}
+
+static BOOL (*orig_ls_openAppOptsErr)(id, SEL, id, id, id);
+static BOOL mw_ls_openAppOptsErr(id self, SEL _cmd, id bid, id opts, id err) {
+    if (MWGate(MWIDStr(bid), @"LSWorkspace.openApplication:options:error:", nil)) return NO;
+    return orig_ls_openAppOptsErr ? orig_ls_openAppOptsErr(self, _cmd, bid, opts, err) : NO;
+}
+
+static BOOL (*orig_ls_openSensitiveErr)(id, SEL, id, id, id);
+static BOOL mw_ls_openSensitiveErr(id self, SEL _cmd, id url, id opts, id err) {
+    NSString *s = MWIDStr(url);
+    if (s.length && MWGate(nil, @"LSWorkspace.openSensitiveURL:error:", s)) return NO;
+    return orig_ls_openSensitiveErr ? orig_ls_openSensitiveErr(self, _cmd, url, opts, err) : NO;
+}
+
 // --- 9.4 安装 ---
 
 static void MWInstallHook(const char *clsName, const char *selName, IMP hook, IMP *orig) {
@@ -956,6 +1061,17 @@ static void MWInstallAllHooks(void) {
                   (IMP)mw_launchApp, (IMP *)&orig_launchApp);
     MWInstallHook("LSApplicationWorkspace", "openApplicationWithBundleID:",
                   (IMP)mw_ls_openApp, (IMP *)&orig_ls_openApp);
+    MWInstallHook("LSApplicationWorkspace", "openApplicationWithBundleID:options:",
+                  (IMP)mw_ls_openAppOpts, (IMP *)&orig_ls_openAppOpts);
+    MWInstallHook("LSApplicationWorkspace", "openApplicationWithBundleID:options:withError:",
+                  (IMP)mw_ls_openAppOptsErr, (IMP *)&orig_ls_openAppOptsErr);
+    MWInstallHook("LSApplicationWorkspace", "openSensitiveURL:withOptions:error:",
+                  (IMP)mw_ls_openSensitiveErr, (IMP *)&orig_ls_openSensitiveErr);
+
+    // 让 SpringBoard 的图标点击手势在接管区里不要开始（遮盖层之外的保险）
+    MWInstallHook("SBIconView", "gestureRecognizerShouldBegin:", (IMP)mw_grShouldBegin, (IMP *)&orig_grShouldBegin);
+    MWInstallHook("SBIconListView", "gestureRecognizerShouldBegin:", (IMP)mw_grShouldBegin2, (IMP *)&orig_grShouldBegin2);
+    MWInstallHook("SBIconController", "iconTapped:", (IMP)mw_iconTapped, (IMP *)&orig_iconTapped);
 
     // 兜底：类名换了的系统上，把带 Widget 字样的图标容器类也挂上
     const char *extra[] = { "SBHWidgetIconView", "SBWidgetIconView" };
