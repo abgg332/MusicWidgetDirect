@@ -1,0 +1,125 @@
+name: Build
+
+# 触发方式：push 到 main/master 自动编；也能在 Actions 页面手动点。
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 关键：必须 false。
+# 设成 true 时，每次新 push 都会掐掉上一个 run；连推几个文件的结果是
+# 「全部 cancelled，一个产物都没有」。
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # 不要用 macos-14：已进入退役流程，任务会在启动前被撤销。
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 版本号和包名都从 control 里读 —— 不要在 workflow 里再写一遍。
+      - name: Read package metadata
+        run: |
+          echo "PKG=$(awk '/^Package:/{print $2; exit}' control)" >> "$GITHUB_ENV"
+          echo "NAME=$(awk '/^Name:/{sub(/^Name:[ ]*/,""); print; exit}' control | tr ' ' '-')" >> "$GITHUB_ENV"
+          echo "VERSION=$(awk '/^Version:/{print $2; exit}' control)" >> "$GITHUB_ENV"
+
+      - name: Install build deps
+        run: brew install ldid dpkg
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      # SDK 是最容易失败的一步（theos/sdks 上游 release 经常 504）。
+      # 三个源依次试：自己的 Release → 官方 → 镜像。10 轮重试 + tar 校验。
+      # 想彻底稳定：把 iPhoneOS16.5.sdk.tar.xz 传到本仓库 Release（tag 叫 sdk-cache），
+      # 下面 PRIMARY 就会命中，官方源只在兜底时用。
+      - name: Install iPhoneOS SDK
+        run: |
+          mkdir -p "$THEOS/sdks"
+          PRIMARY="https://github.com/${{ github.repository }}/releases/download/sdk-cache/iPhoneOS16.5.sdk.tar.xz"
+          FALLBACK="https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz"
+          MIRROR="https://ghfast.top/https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz"
+          ok=0
+          for URL in "$PRIMARY" "$FALLBACK" "$MIRROR"; do
+            for i in 1 2 3; do
+              echo "== 下载 $URL (第 $i 轮)"
+              if curl -fL --retry 3 --retry-delay 4 --retry-all-errors \
+                   --connect-timeout 30 -o /tmp/sdk.tar.xz "$URL" \
+                 && tar -tJf /tmp/sdk.tar.xz >/dev/null 2>&1; then
+                ok=1; break 2
+              fi
+              rm -f /tmp/sdk.tar.xz; sleep 8
+            done
+          done
+          [ "$ok" = "1" ] || { echo "SDK 下载失败，稍后重跑"; exit 1; }
+          tar -xJf /tmp/sdk.tar.xz -C "$THEOS/sdks"
+          ls "$THEOS/sdks"
+
+      # ---------- 包 1：无根 rootless（多巴胺 / palera1n rootless 等） ----------
+      - name: Build rootless (arm64 + arm64e)
+        run: |
+          rm -rf .theos obj packages
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless ARCHS="arm64 arm64e"
+          mv packages/*.deb "packages/${NAME}-${VERSION}-rootless-arm64-arm64e.deb"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-rootless
+          path: packages/*.deb
+          if-no-files-found: error
+          retention-days: 30
+
+      # ---------- 包 2：隐根 roothide（RootHide Bootstrap） ----------
+      - name: Install Theos (roothide fork)
+        run: |
+          rm -rf "$HOME/theos"
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)" \
+            || echo "== 安装脚本的 SDK 步骤失败，下面自己补"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/theos/sdks"
+          if [ ! -d "$HOME/theos/sdks/iPhoneOS16.5.sdk" ]; then
+            FALLBACK="https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz"
+            MIRROR="https://ghfast.top/https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz"
+            ok=0
+            for URL in "$FALLBACK" "$MIRROR"; do
+              for i in 1 2 3; do
+                if curl -fL --retry 3 --retry-delay 4 --retry-all-errors \
+                     --connect-timeout 30 -o /tmp/sdk2.tar.xz "$URL" \
+                   && tar -tJf /tmp/sdk2.tar.xz >/dev/null 2>&1; then ok=1; break 2; fi
+                rm -f /tmp/sdk2.tar.xz; sleep 8
+              done
+            done
+            [ "$ok" = "1" ] || { echo "roothide SDK 补齐失败"; exit 1; }
+            tar -xJf /tmp/sdk2.tar.xz -C "$HOME/theos/sdks"
+          fi
+          ls "$HOME/theos/sdks"
+
+      - name: Build roothide (arm64e)
+        run: |
+          rm -rf .theos obj packages
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide ARCHS=arm64e
+          mv packages/*.deb "packages/${NAME}-${VERSION}-roothide-arm64e.deb"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-roothide
+          path: packages/*.deb
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "### $PKG $VERSION" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh packages/*.deb >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

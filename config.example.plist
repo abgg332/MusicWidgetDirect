@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    配置样例。拷到设备上改名：
+        /var/mobile/Library/Preferences/com.mwdt.musicwidgetdirect.plist
+    保存即生效（不用 respring）。
+    首次装完插件会自动生成一份默认配置，可以直接在它上面改。
+-->
+<plist version="1.0">
+<dict>
+    <key>Enabled</key>
+    <true/>
+
+    <key>VerboseLog</key>
+    <false/>
+
+    <key>SwallowTouch</key>
+    <false/>
+
+    <key>RequireNowPlaying</key>
+    <true/>
+
+    <key>AttachToAllIcons</key>
+    <false/>
+
+    <key>TapWindow</key>
+    <real>2.5</real>
+
+    <!-- 空数组 = 所有小组件都管。只想管一个 App 就填它的主包名 -->
+    <key>BundleIDs</key>
+    <array>
+    </array>
+
+    <!-- 归一化坐标（0~1），左上角为原点。默认：下半部横向三等分 -->
+    <key>Regions</key>
+    <array>
+        <dict>
+            <key>x</key><real>0.00</real>
+            <key>y</key><real>0.55</real>
+            <key>w</key><real>0.34</real>
+            <key>h</key><real>0.45</real>
+            <key>action</key><string>prev</string>
+        </dict>
+        <dict>
+            <key>x</key><real>0.33</real>
+            <key>y</key><real>0.55</real>
+            <key>w</key><real>0.34</real>
+            <key>h</key><real>0.45</real>
+            <key>action</key><string>toggle</string>
+        </dict>
+        <dict>
+            <key>x</key><real>0.66</real>
+            <key>y</key><real>0.55</real>
+            <key>w</key><real>0.34</real>
+            <key>h</key><real>0.45</real>
+            <key>action</key><string>next</string>
+        </dict>
+    </array>
+
+    <!-- 自定义 URL 关键字：URL 里包含该子串就按对应动作处理，优先级最高。
+         例：<key>do=next</key><string>next</string> -->
+    <key>URLKeywords</key>
+    <dict>
+    </dict>
+
+    <key>FallbackAction</key>
+    <string>toggle</string>
+</dict>
+</plist>
